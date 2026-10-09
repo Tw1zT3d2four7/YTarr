@@ -1,1 +1,74 @@
+name: Build YTarr release ZIP
+
+on:
+  push:
+    branches:
+      - main
+    # Avoid rerunning when the workflow's own generated ZIP is the only change.
+    paths-ignore:
+      - release.zip
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ytarr-release-main
+  cancel-in-progress: false
+
+jobs:
+  build-release-zip:
+    name: Package plugin and refresh release.zip
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate plugin files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f plugin.json || { echo "::error::plugin.json is missing from the repository root"; exit 1; }
+          test -f plugin.py || { echo "::error::plugin.py is missing from the repository root"; exit 1; }
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("plugin.json").read_text(encoding="utf-8"))
+          version = manifest.get("version")
+          if not version:
+              raise SystemExit("plugin.json must define a version")
+          print(f"Packaging YTarr version {version}")
+          PY
+
+      - name: Build installable release.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package
+          mkdir -p package/ytarr
+          cp plugin.json plugin.py package/ytarr/
+          if [[ -f README.md ]]; then cp README.md package/ytarr/; fi
+          (
+            cd package
+            zip -qr ../release.zip ytarr
+          )
+          unzip -l release.zip
+
+      - name: Commit updated release.zip to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add release.zip
+          if git diff --cached --quiet; then
+            echo "release.zip is already up to date."
+            exit 0
+          fi
+          VERSION="$(python -c 'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(release): rebuild release.zip for ${VERSION} [skip ci]"
+          git push origin HEAD:main
 
