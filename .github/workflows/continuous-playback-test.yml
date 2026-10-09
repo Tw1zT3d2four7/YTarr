@@ -43,6 +43,8 @@ jobs:
           assert module._scan_interval_minutes({"playlist_scan_interval_minutes": 2}) == 5
           assert module._scan_interval_minutes({"playlist_scan_interval_minutes": 2000}) == 1440
           assert module._scan_interval_minutes({"playlist_scan_interval_minutes": "invalid"}) == 30
+          invalid_scan = module._start_playlist_scanner({"playlist_url_1": "not-a-playlist"})
+          assert invalid_scan["running"] is False
           assert module._radio_stream_url("streamlink", "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y") == "httpstream://http://127.0.0.1:8765/ytarr/radio/PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
           assert module._radio_stream_url("ffmpeg", "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y") == "http://127.0.0.1:8765/ytarr/radio/PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
           module._radio_dependencies = lambda: []
