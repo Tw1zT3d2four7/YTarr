@@ -38,5 +38,12 @@ jobs:
           configured = module._configured_playlists({"playlist_url_1": playlist})
           assert len(configured) == 1 and configured[0][2] == "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
           assert module.RADIO_PORT == 8765
+          module._radio_dependencies = lambda: []
+          started, message = module._ensure_radio_server()
+          assert started, message
+          import urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:8765/ytarr/health", timeout=3) as response:
+              assert response.status == 200
+              assert response.read() == b"YTarr radio ok"
           print("YTarr continuous-playback smoke tests passed")
           PY
