@@ -679,7 +679,7 @@ def _start_playlist_scanner(settings=None):
     global _SCAN_THREAD, _SCAN_SETTINGS
     settings = dict(settings or {})
     playlists = _configured_playlists(settings)
-    if not playlists:
+    if not playlists or any(not playlist_id for _, _, playlist_id in playlists):
         return {"running": False, "interval_minutes": _scan_interval_minutes(settings),
                 "message": "No valid playlists configured; periodic scan is not running."}
     with _SCAN_LOCK:
