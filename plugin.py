@@ -1161,8 +1161,8 @@ def get_settings():
                            "description": "Must match an existing Dispatcharr stream profile."},
         "max_tracks": {"label": "Maximum tracks per playlist", "type": "number", "default": 200,
                        "description": "Safety cap for each playlist; allowed range 1-500."},
-        "continuous_radio": {"label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
-                             "description": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."},
+        "continuous_radio": {"label": "Enable continuous radio playback", "type": "boolean", "default": True,
+                             "description": "When enabled, create radio channels and allow continuous playback. When disabled, existing radio endpoints are also blocked. Requires streamlink and ffmpeg in the Dispatcharr container."},
         "playlist_scan_interval_minutes": {"label": "Playlist rescan interval (minutes)", "type": "number",
                                            "default": 30, "description": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."}
     }
@@ -1214,8 +1214,8 @@ class Plugin:
         {"id": "stream_profile", "label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
          "help_text": "Must exactly match an existing Dispatcharr stream profile."},
         {"id": "max_tracks", "label": "Maximum tracks per playlist", "type": "number", "default": 200},
-        {"id": "continuous_radio", "label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
-         "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in Dispatcharr."},
+        {"id": "continuous_radio", "label": "Enable continuous radio playback", "type": "boolean", "default": True,
+         "help_text": "When enabled, create radio channels and allow their continuous playback endpoints. When disabled, radio playback endpoints return HTTP 503. Requires streamlink and ffmpeg in Dispatcharr."},
         {"id": "playlist_scan_interval_minutes", "label": "Playlist rescan interval (minutes)", "type": "number", "default": 30,
          "help_text": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."},
     ]
