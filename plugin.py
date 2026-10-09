@@ -904,3 +904,15 @@ class Plugin:
         result = run(action, settings)
         return {"status": "ok" if result.get("success") else "error",
                 "message": result.get("message", "YTarr action finished."), "details": result}
+
+# The radio channels persist in Dispatcharr's database across restarts, so bring
+# their local playback endpoint up whenever the enabled plugin is loaded.
+try:
+    _radio_start_ok, _radio_start_message = _ensure_radio_server()
+    if _radio_start_ok:
+        logger.info(_radio_start_message)
+    else:
+        logger.warning(_radio_start_message)
+except Exception:
+    logger.exception("Could not initialize the YTarr continuous radio endpoint")
+
