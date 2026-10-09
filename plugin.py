@@ -22,6 +22,11 @@ RADIO_HOST = "127.0.0.1"
 RADIO_PORT = 8765
 _RADIO_SERVER = None
 _RADIO_SERVER_LOCK = threading.Lock()
+_SCAN_LOCK = threading.Lock()
+_SCAN_STOP = threading.Event()
+_SCAN_THREAD = None
+_SCAN_SETTINGS = {}
+_DEFAULT_SCAN_INTERVAL_MINUTES = 30
 logger = logging.getLogger("ytarr")
 DEFAULT_GROUP = "Country Music"
 DEFAULT_PROFILE = "Streamlink"
@@ -414,6 +419,20 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
                     # Avoid a hot loop if YouTube blocks requests or all tracks fail.
                     time.sleep(5)
                     break
+            # Re-fetch the playlist at the end of each complete pass. Newly added
+            # tracks are appended to this live stream without restarting playback.
+            try:
+                _, refreshed_tracks = _playlist_tracks(playlist_id, max_tracks=500)
+                refreshed_ids = [track["video_id"] for track in refreshed_tracks
+                                 if track.get("video_id")]
+                known_ids = set(video_ids)
+                added_ids = [video_id for video_id in refreshed_ids if video_id not in known_ids]
+                if added_ids:
+                    video_ids.extend(added_ids)
+                    logger.info("YTarr radio playlist %s discovered %d newly added track(s)",
+                                playlist_id, len(added_ids))
+            except Exception as exc:
+                logger.warning("YTarr radio could not refresh playlist %s: %s", playlist_id, exc)
 
 
 def _ensure_radio_server():
@@ -551,6 +570,171 @@ def _create_track(settings, track, group_name, profile, channel_number):
 
 
 
+def _scan_interval_minutes(settings=None):
+    """Parse the periodic playlist scan interval, clamped to 5–1440 minutes."""
+    settings = settings or {}
+    try:
+        interval = int(_setting(settings, "playlist_scan_interval_minutes",
+                                str(_DEFAULT_SCAN_INTERVAL_MINUTES)))
+    except (TypeError, ValueError):
+        interval = _DEFAULT_SCAN_INTERVAL_MINUTES
+    return max(5, min(interval, 1440))
+
+
+def _scan_and_import_new_tracks(settings):
+    """Compare configured public playlists with existing YTarr channels and add missing tracks."""
+    from django.db import close_old_connections
+
+    close_old_connections()
+    try:
+        playlists = _configured_playlists(settings)
+        if not playlists:
+            return {"success": False, "new_tracks": 0, "message": "No valid configured playlists."}
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+        profile_name = _setting(settings, "stream_profile", DEFAULT_PROFILE)
+        profile = _profile_by_name(StreamProfile, profile_name)
+        if profile is None:
+            return {"success": False, "new_tracks": 0,
+                    "message": f"Stream profile '{profile_name}' was not found."}
+        group_name = _setting(settings, "channel_group", DEFAULT_GROUP)
+        try:
+            start_number = max(0, int(_setting(settings, "channel_number", "9901")))
+            max_tracks = max(1, min(500, int(_setting(settings, "max_tracks", "200"))))
+        except (TypeError, ValueError):
+            start_number, max_tracks = 9901, 200
+
+        existing_channels = list(Channel.objects.filter(tvg_id__startswith="ytarr:"))
+        existing_ids = {channel.tvg_id[5:] for channel in existing_channels
+                        if channel.tvg_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", channel.tvg_id[5:])}
+        try:
+            next_number = max([start_number - 1] + [
+                int(channel.channel_number) for channel in existing_channels
+                if channel.channel_number is not None
+            ]) + 1
+        except (TypeError, ValueError):
+            next_number = start_number
+
+        seen_this_scan = set()
+        added = []
+        errors = []
+        for slot, url, playlist_id in playlists:
+            try:
+                playlist_title, tracks = _playlist_tracks(playlist_id, max_tracks=max_tracks)
+                playlist_added = 0
+                for track in tracks:
+                    video_id = track.get("video_id")
+                    if not video_id or video_id in existing_ids or video_id in seen_this_scan:
+                        continue
+                    seen_this_scan.add(video_id)
+                    try:
+                        result = _create_track(settings, track, group_name, profile, next_number)
+                        result.update({"source_playlist_id": playlist_id,
+                                       "source_playlist_title": playlist_title})
+                        added.append(result)
+                        existing_ids.add(video_id)
+                        next_number += 1
+                        playlist_added += 1
+                    except Exception as exc:
+                        errors.append({"playlist_id": playlist_id, "video_id": video_id,
+                                       "error": f"{type(exc).__name__}: {exc}"})
+                if playlist_added:
+                    logger.info("YTarr scan added %d new track(s) from playlist %s (%s)",
+                                playlist_added, playlist_title, playlist_id)
+            except Exception as exc:
+                errors.append({"playlist_id": playlist_id,
+                               "error": f"{type(exc).__name__}: {exc}"})
+                logger.warning("YTarr periodic scan failed for playlist %s: %s", playlist_id, exc)
+
+        epg_result = None
+        if added:
+            try:
+                epg_result = _sync_dummy_epg()
+            except Exception as exc:
+                logger.warning("YTarr added tracks but dummy EPG refresh failed: %s", exc)
+        return {"success": not errors or bool(added), "new_tracks": len(added),
+                "added_tracks": added[:50], "errors": errors[:20],
+                "dummy_epg": epg_result}
+    finally:
+        close_old_connections()
+
+
+def _playlist_scan_worker():
+    """Background worker that periodically compares configured playlists to Dispatcharr."""
+    while not _SCAN_STOP.is_set():
+        interval = _scan_interval_minutes(_SCAN_SETTINGS)
+        if _SCAN_STOP.wait(interval * 60):
+            break
+        with _SCAN_LOCK:
+            settings = dict(_SCAN_SETTINGS)
+        try:
+            result = _scan_and_import_new_tracks(settings)
+            logger.info("YTarr periodic playlist scan complete: %d new track(s) added.",
+                        result.get("new_tracks", 0))
+        except Exception:
+            logger.exception("YTarr periodic playlist scan failed unexpectedly")
+
+
+def _start_playlist_scanner(settings=None):
+    """Start or reconfigure the periodic playlist scanner."""
+    global _SCAN_THREAD, _SCAN_SETTINGS
+    settings = dict(settings or {})
+    playlists = _configured_playlists(settings)
+    if not playlists:
+        return {"running": False, "interval_minutes": _scan_interval_minutes(settings),
+                "message": "No valid playlists configured; periodic scan is not running."}
+    with _SCAN_LOCK:
+        _SCAN_SETTINGS = settings
+        if _SCAN_THREAD is not None and _SCAN_THREAD.is_alive():
+            return {"running": True, "interval_minutes": _scan_interval_minutes(settings),
+                    "message": "Periodic YouTube playlist scan is running."}
+        _SCAN_STOP.clear()
+        _SCAN_THREAD = threading.Thread(target=_playlist_scan_worker,
+                                        name="ytarr-playlist-scanner", daemon=True)
+        _SCAN_THREAD.start()
+    return {"running": True, "interval_minutes": _scan_interval_minutes(settings),
+            "message": "Periodic YouTube playlist scan started."}
+
+
+def _settings_from_existing_radio_channels():
+    """Recover scan configuration from persisted YTarr radio channels after restart."""
+    try:
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+        radio_streams = list(Stream.objects.filter(tvg_id__startswith="ytarr:radio:"))
+        if not radio_streams:
+            return {}
+        settings = {
+            "channel_group": DEFAULT_GROUP,
+            "stream_profile": DEFAULT_PROFILE,
+            "channel_number": 9901,
+            "max_tracks": 500,
+            "playlist_scan_interval_minutes": _DEFAULT_SCAN_INTERVAL_MINUTES,
+            "continuous_radio": True,
+        }
+        playlist_ids = []
+        for stream in radio_streams:
+            playlist_id = (getattr(stream, "tvg_id", "") or "").removeprefix("ytarr:radio:")
+            if re.fullmatch(r"[A-Za-z0-9_-]{10,80}", playlist_id) and playlist_id not in playlist_ids:
+                playlist_ids.append(playlist_id)
+            group = getattr(stream, "channel_group", None)
+            if group and getattr(group, "name", None):
+                settings["channel_group"] = group.name
+            profile = getattr(stream, "stream_profile", None)
+            if profile and getattr(profile, "name", None):
+                settings["stream_profile"] = profile.name
+        for index, playlist_id in enumerate(playlist_ids[:5], 1):
+            settings[f"playlist_url_{index}"] = playlist_id
+        channels = Channel.objects.filter(tvg_id__startswith="ytarr:")
+        numbers = [int(value) for value in channels.values_list("channel_number", flat=True)
+                   if value is not None]
+        if numbers:
+            settings["channel_number"] = max(numbers) + 1
+        return settings if playlist_ids else {}
+    except Exception:
+        logger.debug("Could not recover YTarr playlist scanner settings from existing channels",
+                     exc_info=True)
+        return {}
+
+
 def _sync_dummy_epg():
     """Attach YTarr channels to a native Dispatcharr dummy EPG with placeholder listings.
 
@@ -669,6 +853,8 @@ def check_status(settings=None):
                 "available_profiles": names,
                 "radio_dependencies": {"required": ["streamlink", "ffmpeg"], "missing": missing_radio_tools},
                 "continuous_radio_ready": not missing_radio_tools,
+                "playlist_scanner": {"running": bool(_SCAN_THREAD and _SCAN_THREAD.is_alive()),
+                                     "interval_minutes": _scan_interval_minutes(settings)},
                 "playlist_url_validation": "Supports YouTube and YouTube Music playlist URLs and individual video URLs."}
     except Exception as exc:
         return {"success": False, "message": f"Could not access Dispatcharr models: {type(exc).__name__}: {exc}"}
@@ -819,6 +1005,7 @@ def import_playlist(settings=None):
         except Exception as exc:
             epg_error = f"{type(exc).__name__}: {exc}"
         ok_count = sum(1 for item in playlist_results if item.get("imported_or_updated", 0) > 0)
+        scan_status = _start_playlist_scanner(settings)
         return {"success": bool(imported),
                 "message": f"Imported/updated {len(imported)} unique tracks from {ok_count} of {len(playlists)} configured playlist(s).",
                 "configured_playlists": len(playlists), "playlist_results": playlist_results,
@@ -830,7 +1017,8 @@ def import_playlist(settings=None):
                 "continuous_radio_status": radio_status,
                 "continuous_radio_channels": radio_channels,
                 "continuous_radio_errors": radio_errors,
-                "note": "Each configured playlist gets a continuous radio channel when enabled. The local endpoint advances through playlist tracks automatically; individual track channels remain available too."}
+                "playlist_scanner": scan_status,
+                "note": "YTarr periodically compares each configured playlist with existing channels and imports newly added tracks; the continuous radio also refreshes its playlist after each pass."}
     except Exception as exc:
         return {"success": False, "message": f"Playlist import failed: {type(exc).__name__}: {exc}"}
 
@@ -844,7 +1032,9 @@ def get_settings():
         "max_tracks": {"label": "Maximum tracks per playlist", "type": "number", "default": 200,
                        "description": "Safety cap for each playlist; allowed range 1-500."},
         "continuous_radio": {"label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
-                             "description": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."}
+                             "description": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."},
+        "playlist_scan_interval_minutes": {"label": "Playlist rescan interval (minutes)", "type": "number",
+                                           "default": 30, "description": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."}
     }
     for index in range(1, 6):
         fields[f"playlist_url_{index}"] = {
@@ -879,8 +1069,8 @@ def run(action, settings=None, **kwargs):
 
 class Plugin:
     name = "YTarr"
-    version = "0.2.5-test"
-    description = "Import YouTube Music playlists with artwork, dummy EPG, and continuous radio channels."
+    version = "0.2.6-test"
+    description = "Import YouTube Music playlists with artwork, dummy EPG, continuous radio, and automatic playlist rescans."
     author = "Tw1zT3d2four7"
     fields = [
         {"id": "playlist_url_1", "label": "YouTube Music playlist 1 URL", "type": "string", "default": DEFAULT_PLAYLIST,
@@ -896,6 +1086,8 @@ class Plugin:
         {"id": "max_tracks", "label": "Maximum tracks per playlist", "type": "number", "default": 200},
         {"id": "continuous_radio", "label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
          "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in Dispatcharr."},
+        {"id": "playlist_scan_interval_minutes", "label": "Playlist rescan interval (minutes)", "type": "number", "default": 30,
+         "help_text": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."},
     ]
     actions = [
         {"id": "check_status", "label": "Check YTarr Status", "description": "Check model access and configured profile.",
@@ -913,6 +1105,10 @@ class Plugin:
         logger = context.get("logger")
         if logger:
             logger.info("YTarr action requested: %s", action)
+        # Reconfigure/start the scanner whenever Dispatcharr invokes the plugin
+        # with its persisted settings, not only when Import Playlists is clicked.
+        if _configured_playlists(settings):
+            _start_playlist_scanner(settings)
         result = run(action, settings)
         return {"status": "ok" if result.get("success") else "error",
                 "message": result.get("message", "YTarr action finished."), "details": result}
@@ -925,6 +1121,12 @@ try:
         logger.info(_radio_start_message)
     else:
         logger.warning(_radio_start_message)
+    # On container/plugin restart, rebuild scanner configuration from persisted
+    # radio streams so rescans resume without a manual re-import.
+    _recovered_scan_settings = _settings_from_existing_radio_channels()
+    if _recovered_scan_settings:
+        _scan_status = _start_playlist_scanner(_recovered_scan_settings)
+        logger.info(_scan_status.get("message", "YTarr scanner startup attempted"))
 except Exception:
     logger.exception("Could not initialize the YTarr continuous radio endpoint")
 
