@@ -1,4 +1,4 @@
-# YTarr 0.2.4-test
+# YTarr 0.2.4
 
 Dispatcharr plugin for importing up to five public YouTube / YouTube Music playlists. It creates or updates one selectable channel per unique track in the configured group (default: `Country Music`). Track title, artist, and album-art thumbnail are read from playlist metadata automatically.
 
