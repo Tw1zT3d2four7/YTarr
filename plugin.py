@@ -1,16 +1,28 @@
-"""YTarr 0.2.4-test: YouTube / YouTube Music playlist importer for Dispatcharr.
+"""YTarr 0.2.5-test: YouTube / YouTube Music playlist importer for Dispatcharr.
 
 This plugin uses only Python's standard library and Dispatcharr's own models.
 It does not add a companion service/container or change Dispatcharr itself.
 """
 import json
+import logging
+import os
 import re
+import shutil
+import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 PLUGIN_ID = "ytarr"
+RADIO_HOST = "127.0.0.1"
+RADIO_PORT = 8765
+_RADIO_SERVER = None
+_RADIO_SERVER_LOCK = threading.Lock()
+logger = logging.getLogger("ytarr")
 DEFAULT_GROUP = "Country Music"
 DEFAULT_PROFILE = "Streamlink"
 DEFAULT_PLAYLIST = "https://music.youtube.com/playlist?list=PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
@@ -296,6 +308,188 @@ def _playlist_tracks(playlist_id, max_tracks=500):
     return title, tracks
 
 
+
+def _radio_dependencies():
+    """Return missing runtime tools required by the continuous radio endpoint."""
+    return [name for name in ("streamlink", "ffmpeg") if shutil.which(name) is None]
+
+
+class _RadioRequestHandler(BaseHTTPRequestHandler):
+    """Serve an endless MP3 stream by playing a YouTube playlist in order."""
+
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, fmt, *args):
+        logger.info("YTarr radio HTTP: " + fmt, *args)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/ytarr/health":
+            body = b"YTarr radio ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        match = re.fullmatch(r"/ytarr/radio/([A-Za-z0-9_-]{10,80})", path)
+        if not match:
+            self.send_error(404, "Unknown YTarr radio endpoint")
+            return
+        missing = _radio_dependencies()
+        if missing:
+            self.send_error(503, "YTarr radio requires: " + ", ".join(missing))
+            return
+
+        playlist_id = match.group(1)
+        try:
+            playlist_title, tracks = _playlist_tracks(playlist_id, max_tracks=500)
+        except Exception as exc:
+            logger.warning("YTarr radio could not load playlist %s: %s", playlist_id, exc)
+            self.send_error(502, "Could not load the YouTube playlist")
+            return
+        video_ids = [track["video_id"] for track in tracks if track.get("video_id")]
+        if not video_ids:
+            self.send_error(502, "The YouTube playlist contains no playable tracks")
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        # Keep one HTTP response open and resolve each track only when needed.
+        # That avoids expired YouTube media URLs and gives players one continuous
+        # audio stream rather than requiring the user to select each channel.
+        while True:
+            failed_tracks = 0
+            for video_id in video_ids:
+                watch_url = "https://www.youtube.com/watch?v=" + video_id
+                process = None
+                try:
+                    resolved = subprocess.run(
+                        ["streamlink", "--loglevel", "error", "--stream-url", watch_url, "best"],
+                        capture_output=True, text=True, timeout=40, check=True,
+                    ).stdout.strip().splitlines()
+                    if not resolved or not resolved[-1].startswith(("http://", "https://")):
+                        raise RuntimeError("Streamlink did not return a media URL")
+                    media_url = resolved[-1]
+                    process = subprocess.Popen(
+                        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                         "-i", media_url, "-map", "0:a:0?", "-vn", "-ac", "2",
+                         "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k",
+                         "-f", "mp3", "-write_xing", "0", "-id3v2_version", "0", "pipe:1"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+                    )
+                    while True:
+                        chunk = process.stdout.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    exit_code = process.wait()
+                    if exit_code:
+                        failed_tracks += 1
+                        logger.warning("YTarr radio ffmpeg exited %s for video %s", exit_code, video_id)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    if process and process.poll() is None:
+                        process.terminate()
+                    return
+                except Exception as exc:
+                    failed_tracks += 1
+                    logger.warning("YTarr radio skipped video %s: %s", video_id, exc)
+                    if process and process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                if failed_tracks >= len(video_ids):
+                    # Avoid a hot loop if YouTube blocks requests or all tracks fail.
+                    time.sleep(5)
+                    break
+
+
+def _ensure_radio_server():
+    """Start the local HTTP endpoint in this Dispatcharr process, if needed."""
+    global _RADIO_SERVER
+    missing = _radio_dependencies()
+    if missing:
+        return False, "Continuous radio requires executable(s) not found in Dispatcharr: " + ", ".join(missing)
+    with _RADIO_SERVER_LOCK:
+        if _RADIO_SERVER is not None:
+            return True, "YTarr radio endpoint is running."
+        try:
+            server = ThreadingHTTPServer((RADIO_HOST, RADIO_PORT), _RadioRequestHandler)
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, name="ytarr-radio-http", daemon=True)
+            thread.start()
+            _RADIO_SERVER = server
+            return True, f"YTarr radio endpoint listening on {RADIO_HOST}:{RADIO_PORT}."
+        except OSError as exc:
+            # A different Dispatcharr worker may already own the port. Accept it
+            # only when it answers our health check, never for an arbitrary service.
+            try:
+                with urllib.request.urlopen(
+                    f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/health", timeout=2
+                ) as response:
+                    healthy = response.status == 200 and response.read(128).strip() == b"YTarr radio ok"
+                if healthy:
+                    return True, "YTarr radio endpoint is running in another Dispatcharr worker."
+            except Exception:
+                pass
+            return False, f"Could not start YTarr radio endpoint on port {RADIO_PORT}: {exc}"
+
+
+def _create_radio_channel(playlist_id, playlist_title, group_name, profile, channel_number):
+    """Create one stable, continuous radio channel for a configured playlist."""
+    Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+    group, _ = ChannelGroup.objects.get_or_create(name=group_name)
+    safe_title = (playlist_title or "YouTube Playlist").strip() or "YouTube Playlist"
+    channel_name = (safe_title + " Radio")[:512]
+    tvg_id = f"ytarr:radio:{playlist_id}"
+    radio_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
+    stream_defaults = {
+        "name": channel_name, "url": radio_url, "channel_group": group,
+        "stream_profile": profile, "is_custom": True, "is_radio": True,
+        "custom_properties": {
+            "provider": "ytarr", "continuous_radio": True,
+            "playlist_id": playlist_id, "playlist_title": safe_title,
+            "playback_endpoint": radio_url,
+        },
+    }
+    stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
+    if not stream_created:
+        for key, value in stream_defaults.items():
+            setattr(stream, key, value)
+        stream.save()
+    channel = Channel.objects.filter(tvg_id=tvg_id).first()
+    channel_created = channel is None
+    if channel is None:
+        channel = Channel()
+    channel.name = channel_name
+    channel.channel_number = channel_number
+    channel.channel_group = group
+    channel.stream_profile = profile
+    channel.tvg_id = tvg_id
+    channel.is_radio = True
+    channel.save()
+    channel.streams.add(stream)
+    channel.refresh_from_db()
+    return {
+        "channel": channel.name, "channel_number": channel_number,
+        "channel_id": channel.pk, "stream_id": stream.pk,
+        "playlist_id": playlist_id, "playback_url": radio_url,
+        "created": channel_created or stream_created,
+    }
+
+
 def _create_track(settings, track, group_name, profile, channel_number):
     Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
     group, _ = ChannelGroup.objects.get_or_create(name=group_name)
@@ -457,9 +651,12 @@ def check_status(settings=None):
     try:
         Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
         names = _profile_names(StreamProfile)
+        missing_radio_tools = _radio_dependencies()
         return {"success": True, "message": "YTarr can access Dispatcharr models.",
                 "configured_profile": profile_name, "profile_found": _profile_by_name(StreamProfile, profile_name) is not None,
                 "available_profiles": names,
+                "radio_dependencies": {"required": ["streamlink", "ffmpeg"], "missing": missing_radio_tools},
+                "continuous_radio_ready": not missing_radio_tools,
                 "playlist_url_validation": "Supports YouTube and YouTube Music playlist URLs and individual video URLs."}
     except Exception as exc:
         return {"success": False, "message": f"Could not access Dispatcharr models: {type(exc).__name__}: {exc}"}
@@ -556,6 +753,9 @@ def import_playlist(settings=None):
             return {"success": False, "message": f"Stream profile '{profile_name}' was not found.", "available_profiles": _profile_names(StreamProfile)}
 
         imported, errors, playlist_results, seen_video_ids = [], [], [], set()
+        radio_channels, radio_errors = [], []
+        continuous_radio = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
+        radio_ready, radio_status = _ensure_radio_server() if continuous_radio else (False, "Continuous radio disabled.")
         next_channel_number = start_number
         for slot, url, playlist_id in playlists:
             try:
@@ -581,6 +781,18 @@ def import_playlist(settings=None):
                         errors.append({"playlist_id": playlist_id, "video_id": video_id, "error": f"{type(exc).__name__}: {exc}"})
                 playlist_results.append({"slot": slot, "playlist_id": playlist_id, "playlist_title": playlist_title,
                                          "tracks_found": len(tracks), "imported_or_updated": playlist_imported})
+                if continuous_radio:
+                    if radio_ready:
+                        try:
+                            radio = _create_radio_channel(
+                                playlist_id, playlist_title, group_name, profile, next_channel_number
+                            )
+                            radio_channels.append(radio)
+                            next_channel_number += 1
+                        except Exception as exc:
+                            radio_errors.append({"playlist_id": playlist_id, "error": f"{type(exc).__name__}: {exc}"})
+                    else:
+                        radio_errors.append({"playlist_id": playlist_id, "error": radio_status})
             except urllib.error.HTTPError as exc:
                 playlist_results.append({"slot": slot, "playlist_id": playlist_id, "error": f"YouTube Music rejected request (HTTP {exc.code}). Playlist may be private or endpoint changed."})
             except urllib.error.URLError as exc:
@@ -602,8 +814,11 @@ def import_playlist(settings=None):
                 "tracks_imported_or_updated": len(imported), "errors": errors[:20],
                 "dummy_epg": epg_result, "dummy_epg_error": epg_error,
                 "duplicate_tracks_skipped": "Duplicate video IDs across playlists are imported only once.",
-                "continuous_radio_channel": False,
-                "note": "This test build creates selectable individual track channels. A single continuous channel that automatically advances tracks is not implemented yet."}
+                "continuous_radio_enabled": continuous_radio,
+                "continuous_radio_status": radio_status,
+                "continuous_radio_channels": radio_channels,
+                "continuous_radio_errors": radio_errors,
+                "note": "Each configured playlist gets a continuous radio channel when enabled. The local endpoint advances through playlist tracks automatically; individual track channels remain available too."}
     except Exception as exc:
         return {"success": False, "message": f"Playlist import failed: {type(exc).__name__}: {exc}"}
 
@@ -615,7 +830,9 @@ def get_settings():
         "stream_profile": {"label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
                            "description": "Must match an existing Dispatcharr stream profile."},
         "max_tracks": {"label": "Maximum tracks per playlist", "type": "number", "default": 200,
-                       "description": "Safety cap for each playlist; allowed range 1-500."}
+                       "description": "Safety cap for each playlist; allowed range 1-500."},
+        "continuous_radio": {"label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
+                             "description": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."}
     }
     for index in range(1, 6):
         fields[f"playlist_url_{index}"] = {
@@ -650,8 +867,8 @@ def run(action, settings=None, **kwargs):
 
 class Plugin:
     name = "YTarr"
-    version = "0.2.4-test"
-    description = "Import YouTube Music playlists with artwork and generate a native dummy EPG for guide labels."
+    version = "0.2.5-test"
+    description = "Import YouTube Music playlists with artwork, dummy EPG, and continuous radio channels."
     author = "Tw1zT3d2four7"
     fields = [
         {"id": "playlist_url_1", "label": "YouTube Music playlist 1 URL", "type": "string", "default": DEFAULT_PLAYLIST,
@@ -665,6 +882,8 @@ class Plugin:
         {"id": "stream_profile", "label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
          "help_text": "Must exactly match an existing Dispatcharr stream profile."},
         {"id": "max_tracks", "label": "Maximum tracks per playlist", "type": "number", "default": 200},
+        {"id": "continuous_radio", "label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
+         "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in Dispatcharr."},
     ]
     actions = [
         {"id": "check_status", "label": "Check YTarr Status", "description": "Check model access and configured profile.",
