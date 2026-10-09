@@ -24,6 +24,7 @@ _RADIO_SERVER = None
 _RADIO_SERVER_LOCK = threading.Lock()
 _SCAN_LOCK = threading.Lock()
 _SCAN_STOP = threading.Event()
+_SCAN_WAKE = threading.Event()
 _SCAN_THREAD = None
 _SCAN_SETTINGS = {}
 _DEFAULT_SCAN_INTERVAL_MINUTES = 30
@@ -662,7 +663,10 @@ def _playlist_scan_worker():
     """Background worker that periodically compares configured playlists to Dispatcharr."""
     while not _SCAN_STOP.is_set():
         interval = _scan_interval_minutes(_SCAN_SETTINGS)
-        if _SCAN_STOP.wait(interval * 60):
+        if _SCAN_WAKE.wait(interval * 60):
+            _SCAN_WAKE.clear()
+            continue
+        if _SCAN_STOP.is_set():
             break
         with _SCAN_LOCK:
             settings = dict(_SCAN_SETTINGS)
@@ -683,11 +687,15 @@ def _start_playlist_scanner(settings=None):
         return {"running": False, "interval_minutes": _scan_interval_minutes(settings),
                 "message": "No valid playlists configured; periodic scan is not running."}
     with _SCAN_LOCK:
+        settings_changed = settings != _SCAN_SETTINGS
         _SCAN_SETTINGS = settings
         if _SCAN_THREAD is not None and _SCAN_THREAD.is_alive():
+            if settings_changed:
+                _SCAN_WAKE.set()
             return {"running": True, "interval_minutes": _scan_interval_minutes(settings),
                     "message": "Periodic YouTube playlist scan is running."}
         _SCAN_STOP.clear()
+        _SCAN_WAKE.clear()
         _SCAN_THREAD = threading.Thread(target=_playlist_scan_worker,
                                         name="ytarr-playlist-scanner", daemon=True)
         _SCAN_THREAD.start()
