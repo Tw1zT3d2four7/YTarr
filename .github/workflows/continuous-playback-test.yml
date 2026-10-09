@@ -1,0 +1,42 @@
+name: Continuous playback test validation
+
+on:
+  push:
+    branches:
+      - continuous-playback-test
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out test branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile plugin
+        run: python -m py_compile plugin.py
+      - name: Validate manifest JSON
+        run: python -m json.tool plugin.json > /dev/null
+      - name: Smoke-test URL parsing and playlist configuration
+        run: |
+          python - <<'PY'
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("ytarr_plugin", "plugin.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert module._video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+          playlist = "https://music.youtube.com/playlist?list=PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
+          assert module._playlist_id(playlist) == "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
+          configured = module._configured_playlists({"playlist_url_1": playlist})
+          assert len(configured) == 1 and configured[0][2] == "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
+          assert module.RADIO_PORT == 8765
+          print("YTarr continuous-playback smoke tests passed")
+          PY
