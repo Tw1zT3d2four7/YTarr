@@ -78,7 +78,7 @@ jobs:
               ) as response:
                   assert response.status == 200
                   assert response.headers.get_content_type() == "audio/mpeg"
-                  audio = response.read(42)
+                  audio = response.read(44)
                   assert audio.startswith(b"YTARR_TEST_AUDIO_FRAME"), audio
                   assert audio.count(b"YTARR_TEST_AUDIO_FRAME") >= 2, audio
           print("YTarr continuous-playback smoke tests passed")
