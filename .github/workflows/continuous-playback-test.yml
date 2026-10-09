@@ -45,5 +45,28 @@ jobs:
           with urllib.request.urlopen("http://127.0.0.1:8765/ytarr/health", timeout=3) as response:
               assert response.status == 200
               assert response.read() == b"YTarr radio ok"
+          import os, tempfile
+          with tempfile.TemporaryDirectory() as temp_dir:
+              fake_tools = {
+                  "streamlink": "#!/usr/bin/env python3\\nprint('https://example.test/fake-audio')\\n",
+                  "ffmpeg": "#!/usr/bin/env python3\\nimport sys\\nsys.stdout.buffer.write(b'YTARR_TEST_AUDIO_FRAME')\\nsys.stdout.buffer.flush()\\n",
+              }
+              for name, script in fake_tools.items():
+                  path = os.path.join(temp_dir, name)
+                  with open(path, "w", encoding="utf-8") as handle:
+                      handle.write(script)
+                  os.chmod(path, 0o755)
+              os.environ["PATH"] = temp_dir + os.pathsep + os.environ["PATH"]
+              module._playlist_tracks = lambda playlist_id, max_tracks=500: (
+                  "Smoke Test Playlist", [{"video_id": "dQw4w9WgXcQ"}]
+              )
+              with urllib.request.urlopen(
+                  "http://127.0.0.1:8765/ytarr/radio/PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y",
+                  timeout=5,
+              ) as response:
+                  assert response.status == 200
+                  assert response.headers.get_content_type() == "audio/mpeg"
+                  audio = response.read(20)
+                  assert audio.startswith(b"YTARR_TEST_AUDIO"), audio
           print("YTarr continuous-playback smoke tests passed")
           PY
