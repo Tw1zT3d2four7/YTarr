@@ -22,6 +22,7 @@ RADIO_HOST = "127.0.0.1"
 RADIO_PORT = 8765
 _RADIO_SERVER = None
 _RADIO_SERVER_LOCK = threading.Lock()
+_RADIO_ENABLED = True
 _SCAN_LOCK = threading.Lock()
 _SCAN_STOP = threading.Event()
 _SCAN_WAKE = threading.Event()
@@ -348,6 +349,10 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
             self.send_error(503, "YTarr radio requires: " + ", ".join(missing))
             return
 
+        if not _RADIO_ENABLED:
+            self.send_error(503, "YTarr continuous radio is disabled in plugin settings")
+            return
+
         playlist_id = match.group(1)
         try:
             playlist_title, tracks = _playlist_tracks(playlist_id, max_tracks=500)
@@ -373,16 +378,6 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
         # Encode all playlist tracks through one persistent MP3 encoder. Starting
         # a fresh MP3 muxer per song can expose per-file duration/Xing metadata;
         # some clients then stop at the first track even while HTTP stays open.
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
         stop_event = threading.Event()
         encoder = None
         decoder_state = {"process": None}
@@ -1056,6 +1051,8 @@ def import_playlist(settings=None):
         imported, errors, playlist_results, seen_video_ids = [], [], [], set()
         radio_channels, radio_errors = [], []
         continuous_radio = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
+        global _RADIO_ENABLED
+        _RADIO_ENABLED = continuous_radio
         radio_ready, radio_status = _ensure_radio_server() if continuous_radio else (False, "Continuous radio disabled.")
         next_channel_number = start_number
         for slot, url, playlist_id in playlists:
@@ -1205,6 +1202,10 @@ class Plugin:
     def run(self, action: str, params: dict, context: dict):
         context = context or {}
         settings = context.get("settings", {}) or {}
+        # The setting controls actual radio playback as well as channel creation.
+        # Keep this process-wide gate in sync on every plugin action, not just imports.
+        global _RADIO_ENABLED
+        _RADIO_ENABLED = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
         logger = context.get("logger")
         if logger:
             logger.info("YTarr action requested: %s", action)
