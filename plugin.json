@@ -1,37 +1,53 @@
 {
   "name": "YTarr",
-  "version": "0.1.3-test",
+  "version": "0.2.4-test",
   "author": "Tw1zT3d2four7",
-  "description": "YTarr proof-of-concept: create a Dispatcharr test channel from a YouTube video URL, with verified channel-group assignment.",
+  "description": "Import up to five YouTube Music playlists into Dispatcharr with artwork and a native dummy EPG for guide listings.",
   "fields": [
     {
-      "id": "youtube_url",
-      "label": "YouTube video URL or video ID",
+      "id": "playlist_url_1",
+      "label": "YouTube Music playlist 1 URL",
       "type": "string",
-      "default": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-      "help_text": "Test only. Use a public video you are authorized to access."
+      "default": "https://music.youtube.com/playlist?list=PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y",
+      "help_text": "Public YouTube / YouTube Music playlist URL."
     },
     {
-      "id": "title",
-      "label": "Track title",
+      "id": "playlist_url_2",
+      "label": "YouTube Music playlist 2 URL",
       "type": "string",
-      "default": "YTarr Playback Test"
+      "default": "",
+      "help_text": "Leave blank to skip."
     },
     {
-      "id": "artist",
-      "label": "Artist",
+      "id": "playlist_url_3",
+      "label": "YouTube Music playlist 3 URL",
       "type": "string",
-      "default": "YTarr Test"
+      "default": "",
+      "help_text": "Leave blank to skip."
+    },
+    {
+      "id": "playlist_url_4",
+      "label": "YouTube Music playlist 4 URL",
+      "type": "string",
+      "default": "",
+      "help_text": "Leave blank to skip."
+    },
+    {
+      "id": "playlist_url_5",
+      "label": "YouTube Music playlist 5 URL",
+      "type": "string",
+      "default": "",
+      "help_text": "Leave blank to skip."
     },
     {
       "id": "channel_group",
-      "label": "Channel group",
+      "label": "Imported channel group",
       "type": "string",
-      "default": "YTarr Music TEST"
+      "default": "Country Music"
     },
     {
       "id": "channel_number",
-      "label": "Channel number",
+      "label": "Starting channel number",
       "type": "number",
       "default": 9901
     },
@@ -40,30 +56,45 @@
       "label": "Stream profile name",
       "type": "string",
       "default": "Streamlink",
-      "help_text": "Must exactly match an existing Dispatcharr stream profile."
+      "help_text": "Must match an existing Dispatcharr stream profile."
+    },
+    {
+      "id": "max_tracks",
+      "label": "Maximum tracks per playlist",
+      "type": "number",
+      "default": 200,
+      "help_text": "Safety cap per playlist; allowed range 1-500."
     }
   ],
   "actions": [
     {
       "id": "check_status",
-      "label": "Check YTarr Test Status",
-      "description": "Check access to Dispatcharr models and the selected stream profile.",
+      "label": "Check YTarr Status",
+      "description": "Check Dispatcharr model access and stream profile.",
       "button_label": "Check Status",
       "button_variant": "filled",
       "button_color": "blue"
     },
     {
-      "id": "create_test_channel",
-      "label": "Create / Update Test Track Channel",
-      "description": "Create or update one test channel using a canonical YouTube URL.",
-      "button_label": "Create Test Channel",
+      "id": "import_playlist",
+      "label": "Import YouTube Music Playlists (up to 5)",
+      "description": "Import all configured playlist URLs and create/update one selectable channel per unique track.",
+      "button_label": "Import Playlists",
       "button_variant": "filled",
       "button_color": "green",
       "confirm": {
         "required": true,
-        "title": "Create test channel?",
-        "message": "This will create or update a test channel in Dispatcharr."
+        "title": "Import playlists?",
+        "message": "This will create or update channels for tracks found in up to five configured public playlists."
       }
+    },
+    {
+      "id": "generate_dummy_epg",
+      "label": "Generate/Refresh Dummy EPG",
+      "description": "Generate placeholder programme listings for existing YTarr channels so names appear in the guide.",
+      "button_label": "Refresh Dummy EPG",
+      "button_variant": "filled",
+      "button_color": "blue"
     }
   ]
 }

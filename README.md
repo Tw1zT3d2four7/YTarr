@@ -1,25 +1,27 @@
-# YTarr 0.1.3-test
+# YTarr 0.2.4-test
 
-A small Dispatcharr plugin-interface test. It adds settings and two action buttons through Dispatcharr's documented `Plugin` class interface and manifest fields/actions.
+Dispatcharr plugin for importing up to five public YouTube / YouTube Music playlists. It creates or updates one selectable channel per unique track in the configured group (default: `Country Music`). Track title, artist, and album-art thumbnail are read from playlist metadata automatically.
 
-## Test scope
-- Checks whether the configured stream profile exists and whether Dispatcharr models can be accessed.
-- Creates/updates one test channel and stream pointing at the canonical YouTube watch URL for a supplied video ID.
-- Does **not** yet import a YouTube Music library, extract/refresh playable media URLs, or prove web-player playback. The canonical watch URL may not play directly in Dispatcharr; playback support is a later test.
-- Requires an existing Dispatcharr stream profile. It does not add a service/container or modify Dispatcharr itself.
+## Configure
+1. Import this ZIP through Dispatcharr → Plugins → Import and enable YTarr.
+2. Paste up to five public YouTube or YouTube Music playlist URLs into Playlist URL 1–5. Playlist 1 defaults to the Country Music playlist supplied for testing; unused slots may remain blank.
+3. Select an existing Dispatcharr stream profile (default `Streamlink`), a channel group, a starting channel number, and a per-playlist track cap.
+4. Run **Import YouTube Music Playlists (up to 5)**. The result reports per-playlist outcomes and the total tracks imported/updated.
 
-## Install
-1. In Dispatcharr's **Plugins** page, use **Import** and select this ZIP.
-2. Enable YTarr when prompted.
-3. If the page was already open, refresh/reload the Plugins page or use the plugin discovery refresh control.
-4. Open the YTarr plugin card. The settings fields and action buttons should now be present.
-5. First click **Check Status**. Confirm the configured stream profile matches one of the returned available profiles. Then, if appropriate, click **Create Test Channel**.
+## Artwork behavior
+- Uses the playlist row's highest-resolution album-art thumbnail where available.
+- Saves artwork to Dispatcharr's channel Logo relation and the stream's `logo_url`, so it can appear in the channel UI and stream/M3U output.
+- If album art is absent, falls back to the track's YouTube video thumbnail.
+- Re-import the playlists to update existing channels with artwork; stable `ytarr:<video_id>` identifiers are retained.
 
-If no settings/actions appear after importing this build, capture the Dispatcharr version and plugin page/server log error; do not keep running the previous 0.1.0-test ZIP.
+## Behavior and limits
+- No manual track title, artist, or image fields are needed.
+- Duplicate tracks across configured playlists are imported only once by YouTube video ID. Existing channels are updated using stable `ytarr:<video_id>` identifiers.
+- Public playlists only. YouTube may change its internal web endpoint or block requests; test the import from inside Dispatcharr.
+- This build creates individual selectable track channels. A single continuous radio channel with automatic song advancement is not implemented yet.
+- No Dispatcharr source changes, extra service, or extra container.
 
-
-## 0.1.3-test compatibility fix
-- Corrected the StreamProfile import from `apps.core.models` to `core.models`, matching Dispatcharr's model module path.
-
-
-Version 0.1.3-test fixes blank saved settings falling through to empty strings instead of defaults. The create/update action now reads the saved channel group back and reports the group/channel/stream IDs and verification status.
+## Dummy EPG
+- Imports automatically create/update a native Dispatcharr EPG source named `YTarr Dummy EPG`, link each `ytarr:<video_id>` channel to its EPG entry, and generate seven days of placeholder programme listings. Each listing displays the track/channel name in the guide.
+- Use **Generate/Refresh Dummy EPG** to rebuild listings for already-imported YTarr channels without re-fetching playlists.
+- The generated guide is intentionally dummy data; listings repeat the channel's track name in two-hour blocks and do not represent actual song duration or a live schedule.

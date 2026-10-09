@@ -1,27 +1,32 @@
-"""YTarr proof-of-concept plugin for Dispatcharr.
+"""YTarr 0.2.4-test: YouTube / YouTube Music playlist importer for Dispatcharr.
 
-This test build validates plugin loading and Dispatcharr channel/stream creation.
-It does not yet implement a YouTube Music library or guarantee web-player playback.
+This plugin uses only Python's standard library and Dispatcharr's own models.
+It does not add a companion service/container or change Dispatcharr itself.
 """
-
+import json
 import re
+import urllib.error
+import urllib.request
+from datetime import timedelta
 from urllib.parse import urlparse, parse_qs
 
 PLUGIN_ID = "ytarr"
-DEFAULT_GROUP = "YTarr Music TEST"
+DEFAULT_GROUP = "Country Music"
 DEFAULT_PROFILE = "Streamlink"
+DEFAULT_PLAYLIST = "https://music.youtube.com/playlist?list=PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def _setting(settings, key, default=""):
     value = settings.get(key, default) if isinstance(settings, dict) else default
-    normalized = "" if value is None else str(value).strip()
-    return normalized if normalized else default
+    value = "" if value is None else str(value).strip()
+    return value if value else default
 
 
 def _video_id(raw_url):
-    """Extract an 11-character YouTube video ID from common URL forms or a bare ID."""
+    """Extract a video ID from standard YouTube URLs or a bare 11-character ID."""
     value = (raw_url or "").strip()
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+    if VIDEO_ID_RE.fullmatch(value):
         return value
     try:
         parsed = urlparse(value)
@@ -29,97 +34,433 @@ def _video_id(raw_url):
         if host in ("youtu.be", "www.youtu.be"):
             candidate = parsed.path.strip("/").split("/")[0]
         elif host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+            query = parse_qs(parsed.query)
             if parsed.path == "/watch":
-                candidate = parse_qs(parsed.query).get("v", [""])[0]
+                candidate = query.get("v", [""])[0]
             else:
                 parts = [part for part in parsed.path.split("/") if part]
                 candidate = parts[1] if len(parts) >= 2 and parts[0] in ("embed", "shorts", "live") else ""
         else:
             return None
-        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate or "") else None
+        return candidate if VIDEO_ID_RE.fullmatch(candidate or "") else None
+    except Exception:
+        return None
+
+
+def _playlist_id(raw_url):
+    """Accept regular YouTube and YouTube Music playlist URLs, or a playlist ID."""
+    value = (raw_url or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,80}", value):
+        return value
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        if host not in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"):
+            return None
+        query = parse_qs(parsed.query)
+        candidate = query.get("list", [""])[0].strip()
+        # A playlist URL is identified by its list parameter, including music.youtube.com/playlist.
+        if parsed.path.rstrip("/") not in ("/playlist", "/watch") and not candidate:
+            return None
+        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{10,80}", candidate or "") else None
     except Exception:
         return None
 
 
 def _models():
-    """Import Dispatcharr models lazily so the plugin can load in the plugin manager."""
-    from apps.channels.models import Channel, ChannelGroup, Stream
+    from apps.channels.models import Channel, ChannelGroup, Logo, Stream
     from core.models import StreamProfile
-    return Channel, ChannelGroup, Stream, StreamProfile
+    return Channel, ChannelGroup, Logo, Stream, StreamProfile
 
 
-def _profile_by_name(StreamProfile, profile_name):
+def _profile_by_name(StreamProfile, name):
     try:
-        profiles = StreamProfile.objects.all()
-        for profile in profiles:
-            if getattr(profile, "name", "").strip().casefold() == profile_name.casefold():
+        for profile in StreamProfile.objects.all():
+            if getattr(profile, "name", "").strip().casefold() == name.casefold():
                 return profile
     except Exception:
-        return None
+        pass
     return None
 
 
 def _profile_names(StreamProfile):
     try:
-        return sorted({getattr(profile, "name", "") for profile in StreamProfile.objects.all() if getattr(profile, "name", "")})
+        return sorted({p.name for p in StreamProfile.objects.all() if getattr(p, "name", "")})
     except Exception:
         return []
 
 
-def get_settings():
-    """Settings schema consumed by Dispatcharr's plugin settings UI."""
-    return {
-        "youtube_url": {
-            "label": "YouTube video URL or video ID",
-            "type": "string",
-            "default": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-            "description": "Test only. Use a public video you are authorized to access."
-        },
-        "title": {"label": "Track title", "type": "string", "default": "YTarr Playback Test"},
-        "artist": {"label": "Artist", "type": "string", "default": "YTarr Test"},
-        "channel_group": {"label": "Channel group", "type": "string", "default": DEFAULT_GROUP},
-        "channel_number": {"label": "Channel number", "type": "string", "default": "9901"},
-        "stream_profile": {"label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
-                           "description": "Must match an existing Dispatcharr stream profile."}
+def _text_runs(node):
+    if not isinstance(node, dict):
+        return ""
+    if isinstance(node.get("simpleText"), str):
+        return node["simpleText"].strip()
+    runs = node.get("runs")
+    if isinstance(runs, list):
+        return "".join(str(run.get("text", "")) for run in runs if isinstance(run, dict)).strip()
+    return ""
+
+
+def _collect_renderers(obj, out):
+    """Walk Innertube response trees and collect playlist item renderers."""
+    if isinstance(obj, dict):
+        renderer = obj.get("musicResponsiveListItemRenderer")
+        if isinstance(renderer, dict):
+            out.append(renderer)
+        # Some YouTube responses use the ordinary playlist renderer instead.
+        renderer = obj.get("playlistVideoRenderer")
+        if isinstance(renderer, dict):
+            out.append(renderer)
+        for value in obj.values():
+            _collect_renderers(value, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            _collect_renderers(value, out)
+
+
+def _renderer_track(renderer):
+    video_id = ""
+    playlist_data = renderer.get("playlistItemData") or {}
+    if isinstance(playlist_data, dict):
+        video_id = playlist_data.get("videoId", "")
+    if not video_id:
+        for key in ("navigationEndpoint", "playlistItemData"):
+            endpoint = renderer.get(key)
+            if isinstance(endpoint, dict):
+                video_id = (((endpoint.get("watchEndpoint") or {}).get("videoId")) or "")
+                if video_id:
+                    break
+    if not video_id:
+        for _, value in renderer.items():
+            if isinstance(value, dict):
+                endpoint = value.get("navigationEndpoint") or {}
+                video_id = (((endpoint.get("watchEndpoint") or {}).get("videoId")) or "")
+                if video_id:
+                    break
+    if not VIDEO_ID_RE.fullmatch(video_id or ""):
+        return None
+
+    # YouTube Music playlist rows usually carry album-cover artwork in a
+    # musicThumbnailRenderer. Prefer that over smaller generic thumbnails.
+    artwork_url = _renderer_artwork_url(renderer)
+
+    columns = renderer.get("flexColumns") or []
+    title = ""
+    artist = "Unknown Artist"
+    if columns:
+        first = columns[0].get("musicResponsiveListItemFlexColumnRenderer", {})
+        title = _text_runs(first.get("text", {}))
+    if len(columns) > 1:
+        second = columns[1].get("musicResponsiveListItemFlexColumnRenderer", {})
+        artist_text = _text_runs(second.get("text", {}))
+        if artist_text:
+            # Strip common album/date/duration text after separators when present.
+            artist = artist_text.split(" • ")[0].strip() or artist
+    if not title:
+        title = _text_runs(renderer.get("title", {}))
+    if not title:
+        title = "YouTube Track " + video_id
+    # Standard YouTube video thumbnails are a fallback if a playlist row has
+    # no album art. They still provide a useful per-track image in Dispatcharr.
+    if not artwork_url:
+        artwork_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return {"video_id": video_id, "title": title, "artist": artist,
+            "artwork_url": artwork_url}
+
+
+def _renderer_artwork_url(renderer):
+    """Return the best album-art thumbnail URL available on a playlist row."""
+    candidates = []
+
+    def add_thumbnails(node):
+        if not isinstance(node, dict):
+            return
+        thumbs = node.get("thumbnails")
+        if isinstance(thumbs, list):
+            for thumb in thumbs:
+                if isinstance(thumb, dict) and isinstance(thumb.get("url"), str):
+                    url = thumb["url"].strip()
+                    if url.startswith("https://") or url.startswith("http://"):
+                        try:
+                            width = int(thumb.get("width") or 0)
+                            height = int(thumb.get("height") or 0)
+                        except (TypeError, ValueError):
+                            width = height = 0
+                        candidates.append((width * height, url))
+        for value in node.values():
+            if isinstance(value, dict):
+                add_thumbnails(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        add_thumbnails(item)
+
+    # Prefer the row's primary thumbnail branch; then inspect all nested
+    # thumbnail renderers for YouTube's slightly varying response formats.
+    preferred = []
+    for key in ("thumbnail", "thumbnailRenderer", "musicThumbnailRenderer"):
+        value = renderer.get(key)
+        if isinstance(value, dict):
+            preferred.append(value)
+    for node in preferred:
+        add_thumbnails(node)
+    if not candidates:
+        add_thumbnails(renderer)
+    if not candidates:
+        return ""
+    # Highest-resolution variant first; stable ordering preserves YouTube's
+    # ordering when dimensions are not supplied.
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _innertube_post(payload, timeout=20):
+    endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=body, headers={
+        "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Origin": "https://music.youtube.com", "Referer": "https://music.youtube.com/"
+    }, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _playlist_tracks(playlist_id, max_tracks=500):
+    """Fetch public playlist metadata and tracks using YouTube Music's web browse endpoint."""
+    context = {"client": {"clientName": "WEB_REMIX", "clientVersion": "1.20261007.01.00", "hl": "en", "gl": "US"}}
+    response = _innertube_post({"context": context, "browseId": "VL" + playlist_id})
+    title = "Country Music"
+    # Find a title in header renderer variants.
+    def scan_title(node):
+        nonlocal title
+        if isinstance(node, dict):
+            for key in ("musicDetailHeaderRenderer", "musicEditablePlaylistDetailHeaderRenderer", "playlistHeaderRenderer"):
+                value = node.get(key)
+                if isinstance(value, dict):
+                    candidate = _text_runs(value.get("title", {}))
+                    if candidate:
+                        title = candidate
+                        return True
+            for value in node.values():
+                if scan_title(value):
+                    return True
+        elif isinstance(node, list):
+            for value in node:
+                if scan_title(value):
+                    return True
+        return False
+    scan_title(response)
+
+    tracks, seen = [], set()
+    continuation = None
+    page = response
+    pages = 0
+    while pages < 20 and len(tracks) < max_tracks:
+        renderers = []
+        _collect_renderers(page, renderers)
+        for renderer in renderers:
+            track = _renderer_track(renderer)
+            if track and track["video_id"] not in seen:
+                seen.add(track["video_id"])
+                tracks.append(track)
+                if len(tracks) >= max_tracks:
+                    break
+        if len(tracks) >= max_tracks:
+            break
+        # Find continuation token without depending on one fixed response layout.
+        continuation = None
+        def find_cont(node):
+            if isinstance(node, dict):
+                if "continuationCommand" in node and isinstance(node["continuationCommand"], dict):
+                    token = node["continuationCommand"].get("token")
+                    if token:
+                        return token
+                if node.get("continuation") and isinstance(node["continuation"], dict):
+                    token = node["continuation"].get("continuation")
+                    if token:
+                        return token
+                for value in node.values():
+                    found = find_cont(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = find_cont(value)
+                    if found:
+                        return found
+            return None
+        continuation = find_cont(page)
+        if not continuation:
+            break
+        page = _innertube_post({"context": context, "continuation": continuation})
+        pages += 1
+    return title, tracks
+
+
+def _create_track(settings, track, group_name, profile, channel_number):
+    Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+    group, _ = ChannelGroup.objects.get_or_create(name=group_name)
+    video_id = track["video_id"]
+    title = track.get("title") or ("YouTube Track " + video_id)
+    artist = track.get("artist") or "Unknown Artist"
+    stream_name = f"{artist} - {title}" if artist else title
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    artwork_url = (track.get("artwork_url") or "").strip()
+    tvg_id = f"ytarr:{video_id}"
+    stream_defaults = {
+        "name": stream_name, "url": canonical_url, "channel_group": group,
+        "stream_profile": profile, "is_custom": True, "is_radio": True,
+        "custom_properties": {"provider": "ytarr", "video_id": video_id, "canonical_url": canonical_url,
+                              "artist": artist, "title": title, "playlist_imported": True}
     }
+    if artwork_url:
+        stream_defaults["logo_url"] = artwork_url
+    stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
+    if not stream_created:
+        for key, value in stream_defaults.items():
+            setattr(stream, key, value)
+        stream.save()
+    channel = Channel.objects.filter(tvg_id=tvg_id).first()
+    channel_created = channel is None
+    if channel is None:
+        channel = Channel()
+    channel.name = stream_name
+    channel.channel_number = channel_number
+    channel.channel_group = group
+    channel.stream_profile = profile
+    channel.tvg_id = tvg_id
+    channel.is_radio = True
+    if artwork_url:
+        # Channel.logo is a foreign key to Dispatcharr's Logo table, while the
+        # stream also receives logo_url for M3U/export paths.
+        logo, _ = Logo.objects.get_or_create(
+            url=artwork_url,
+            defaults={"name": (f"{artist} - {title}" if title else artist)[:255]},
+        )
+        channel.logo = logo
+    channel.save()
+    channel.streams.add(stream)
+    channel.refresh_from_db()
+    return {"channel": channel.name, "channel_number": channel_number, "channel_id": channel.pk,
+            "stream_id": stream.pk, "video_id": video_id, "created": channel_created or stream_created}
 
 
-def get_actions():
-    return [
-        {"id": "check_status", "name": "Check YTarr Test Status", "description": "Check model access and the configured stream profile."},
-        {"id": "create_test_channel", "name": "Create / Update Test Track Channel", "description": "Create or update one test channel and its canonical YouTube URL stream."}
-    ]
+
+def _sync_dummy_epg():
+    """Attach YTarr channels to a native Dispatcharr dummy EPG with placeholder listings.
+
+    A seven-day schedule is generated in two-hour blocks. Each block is titled
+    with the channel/track name so the guide has visible programme text without
+    requiring an external XMLTV URL or companion service.
+    """
+    from apps.channels.models import Channel
+    from apps.epg.models import EPGSource, EPGData, ProgramData
+    from django.utils import timezone
+
+    source, _ = EPGSource.objects.get_or_create(
+        name="YTarr Dummy EPG",
+        defaults={
+            "source_type": "dummy",
+            "is_active": True,
+            "refresh_interval": 0,
+            "status": "success",
+            "last_message": "Generated by YTarr for track-channel guide labels.",
+            "custom_properties": {"provider": "ytarr", "managed": True},
+        },
+    )
+    # If an older/source row already exists, ensure it remains a dummy source.
+    changed = False
+    for field, value in (("source_type", "dummy"), ("is_active", True),
+                         ("status", "success"),
+                         ("last_message", "Generated by YTarr for track-channel guide labels.")):
+        if getattr(source, field, None) != value:
+            setattr(source, field, value)
+            changed = True
+    if changed:
+        source.save()
+
+    channels = list(Channel.objects.filter(tvg_id__startswith="ytarr:").select_related("logo"))
+    now = timezone.now()
+    # Begin half an hour ago so every channel has an active listing immediately.
+    schedule_start = now - timedelta(minutes=30)
+    schedule_end = now + timedelta(days=7)
+    created_programmes = 0
+    linked_channels = 0
+    for channel in channels:
+        if not channel.tvg_id:
+            continue
+        icon_url = ""
+        try:
+            icon_url = (channel.logo.url or "")[:500] if channel.logo else ""
+        except Exception:
+            icon_url = ""
+        epg, _ = EPGData.objects.get_or_create(
+            tvg_id=channel.tvg_id,
+            epg_source=source,
+            defaults={"name": channel.name[:512], "icon_url": icon_url or None},
+        )
+        update_epg = False
+        if epg.name != channel.name[:512]:
+            epg.name = channel.name[:512]
+            update_epg = True
+        if icon_url and epg.icon_url != icon_url:
+            epg.icon_url = icon_url
+            update_epg = True
+        if update_epg:
+            epg.save()
+        if channel.epg_data_id != epg.pk:
+            channel.epg_data = epg
+            channel.save()
+        linked_channels += 1
+
+        # Replace only this YTarr EPG entry's generated rows, leaving all other
+        # EPG sources and user-created programme data untouched.
+        ProgramData.objects.filter(epg=epg).delete()
+        slot_start = schedule_start
+        while slot_start < schedule_end:
+            slot_end = min(slot_start + timedelta(hours=2), schedule_end)
+            ProgramData.objects.create(
+                epg=epg,
+                start_time=slot_start,
+                end_time=slot_end,
+                title=channel.name[:255],
+                sub_title="YTarr placeholder listing",
+                description="Dummy EPG listing generated by YTarr. The channel plays the associated YouTube Music track.",
+                tvg_id=channel.tvg_id,
+                custom_properties={"provider": "ytarr", "dummy": True},
+            )
+            created_programmes += 1
+            slot_start = slot_end
+
+    source.last_message = f"YTarr generated dummy listings for {linked_channels} channel(s)."
+    source.status = "success"
+    source.save()
+    return {"epg_source": source.name, "channels_linked": linked_channels,
+            "programmes_created": created_programmes,
+            "schedule_days": 7, "programme_block_hours": 2}
 
 
-def run(action, settings=None, **kwargs):
-    """Run a plugin action. Supports the common Dispatcharr action invocation forms."""
-    settings = settings or {}
-    action_id = action
-    if isinstance(action, dict):
-        action_id = action.get("id") or action.get("action") or action.get("name")
-    action_id = str(action_id or kwargs.get("action_id", "")).strip().lower()
-    if action_id in ("check_status", "check ytarr test status"):
-        return check_status(settings)
-    if action_id in ("create_test_channel", "create / update test track channel", "create_test_track_channel"):
-        return create_test_channel(settings)
-    return {"success": False, "message": f"Unknown YTarr action: {action_id}"}
+def generate_dummy_epg(settings=None):
+    """Refresh dummy EPG data for already-imported YTarr channels."""
+    try:
+        result = _sync_dummy_epg()
+        return {"success": True,
+                "message": f"Generated dummy EPG listings for {result['channels_linked']} YTarr channel(s).",
+                **result}
+    except Exception as exc:
+        return {"success": False,
+                "message": f"Could not generate dummy EPG: {type(exc).__name__}: {exc}"}
 
 
 def check_status(settings=None):
     settings = settings or {}
     profile_name = _setting(settings, "stream_profile", DEFAULT_PROFILE)
     try:
-        Channel, ChannelGroup, Stream, StreamProfile = _models()
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
         names = _profile_names(StreamProfile)
-        profile = _profile_by_name(StreamProfile, profile_name)
-        return {
-            "success": True,
-            "message": "YTarr plugin code is callable and Dispatcharr channel models are accessible.",
-            "configured_profile": profile_name,
-            "profile_found": profile is not None,
-            "available_profiles": names,
-            "next_step": "Run Create / Update Test Track Channel, then test playback in the Dispatcharr webplayer."
-        }
+        return {"success": True, "message": "YTarr can access Dispatcharr models.",
+                "configured_profile": profile_name, "profile_found": _profile_by_name(StreamProfile, profile_name) is not None,
+                "available_profiles": names,
+                "playlist_url_validation": "Supports YouTube and YouTube Music playlist URLs and individual video URLs."}
     except Exception as exc:
         return {"success": False, "message": f"Could not access Dispatcharr models: {type(exc).__name__}: {exc}"}
 
@@ -129,153 +470,218 @@ def create_test_channel(settings=None):
     raw_url = _setting(settings, "youtube_url", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
     video_id = _video_id(raw_url)
     if not video_id:
-        return {"success": False, "message": "Enter a valid YouTube video URL or 11-character video ID."}
+        if _playlist_id(raw_url):
+            return {"success": False, "message": "That is a playlist URL. Use Import YouTube Music Playlist to import its tracks, or enter an individual video URL here."}
+        return {"success": False, "message": "Enter a valid YouTube / YouTube Music video URL, playlist URL, or video ID."}
+    settings = dict(settings)
+    settings["title"] = _setting(settings, "title", "YTarr Playback Test")
+    settings["artist"] = _setting(settings, "artist", "YTarr Test")
+    return _create_one_video(settings, video_id)
 
-    title = _setting(settings, "title", "YTarr Playback Test") or "YTarr Playback Test"
-    artist = _setting(settings, "artist", "YTarr Test") or "YTarr Test"
-    group_name = _setting(settings, "channel_group", DEFAULT_GROUP) or DEFAULT_GROUP
-    profile_name = _setting(settings, "stream_profile", DEFAULT_PROFILE) or DEFAULT_PROFILE
+
+def _create_one_video(settings, video_id):
+    title = _setting(settings, "title", "YTarr Playback Test")
+    artist = _setting(settings, "artist", "YTarr Test")
+    group_name = _setting(settings, "channel_group", DEFAULT_GROUP)
+    profile_name = _setting(settings, "stream_profile", DEFAULT_PROFILE)
     try:
         channel_number = int(_setting(settings, "channel_number", "9901"))
         if channel_number < 0:
             raise ValueError
     except ValueError:
         return {"success": False, "message": "Channel number must be a non-negative integer."}
-
-    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
-    stream_name = f"{artist} - {title}" if artist else title
-    tvg_id = f"ytarr:{video_id}"
-
     try:
-        Channel, ChannelGroup, Stream, StreamProfile = _models()
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
         profile = _profile_by_name(StreamProfile, profile_name)
         if profile is None:
-            return {
-                "success": False,
-                "message": f"Stream profile '{profile_name}' was not found. Set the plugin setting to an existing profile name.",
-                "available_profiles": _profile_names(StreamProfile)
-            }
-
-        group, _ = ChannelGroup.objects.get_or_create(name=group_name)
-
-        stream_defaults = {
-            "name": stream_name,
-            "url": canonical_url,
-            "channel_group": group,
-            "stream_profile": profile,
-            "is_custom": True,
-            "is_radio": True,
-            "custom_properties": {
-                "provider": "ytarr",
-                "video_id": video_id,
-                "canonical_url": canonical_url,
-                "artist": artist,
-                "title": title
-            }
-        }
-        stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
-        if not stream_created:
-            for key, value in stream_defaults.items():
-                setattr(stream, key, value)
-            stream.save()
-
-        channel = Channel.objects.filter(tvg_id=tvg_id).first()
-        channel_created = channel is None
-        if channel is None:
-            channel = Channel()
-        channel.name = stream_name
-        channel.channel_number = channel_number
-        channel.channel_group = group
-        channel.stream_profile = profile
-        channel.tvg_id = tvg_id
-        channel.is_radio = True
-        channel.save()
-        channel.streams.add(stream)
-
-        # Read back the persisted relationships instead of assuming save() succeeded.
-        channel.refresh_from_db()
-        group_exists = ChannelGroup.objects.filter(pk=group.pk, name=group_name).exists()
-        channel_group_name = channel.channel_group.name if channel.channel_group_id else None
-        stream_group_name = stream.channel_group.name if stream.channel_group_id else None
-        if not group_exists or channel_group_name != group_name:
-            return {
-                "success": False,
-                "message": "YTarr saved the test channel but could not verify its channel-group assignment.",
-                "channel": channel.name,
-                "channel_id": channel.pk,
-                "channel_group_expected": group_name,
-                "channel_group_actual": channel_group_name,
-                "stream_group_actual": stream_group_name,
-                "group_exists": group_exists,
-            }
-
-        return {
-            "success": True,
-            "message": ("Created" if channel_created else "Updated") + " YTarr test channel. Channel and group records were saved; playback is a separate verification.",
-            "channel": channel.name,
-            "channel_number": channel_number,
-            "channel_group": group_name,
-            "channel_group_id": group.pk,
-            "channel_group_verified": group_exists and channel_group_name == group_name,
-            "channel_group_actual": channel_group_name,
-            "stream_group_actual": stream_group_name,
-            "channel_id": channel.pk,
-            "stream_id": stream.pk,
-            "stream_profile": profile_name,
-            "video_id": video_id,
-            "canonical_url": canonical_url,
-            "stream_created": stream_created,
-            "channel_created": channel_created,
-            "playback_verified": False
-        }
+            return {"success": False, "message": f"Stream profile '{profile_name}' was not found.", "available_profiles": _profile_names(StreamProfile)}
+        result = _create_track(settings, {"video_id": video_id, "title": title, "artist": artist}, group_name, profile, channel_number)
+        result.update({"success": True, "message": "Created/updated one track channel. Playback must be tested separately.",
+                       "channel_group": group_name, "stream_profile": profile_name,
+                       "canonical_url": f"https://www.youtube.com/watch?v={video_id}", "playback_verified": False})
+        return result
     except Exception as exc:
         return {"success": False, "message": f"Could not create/update the test channel: {type(exc).__name__}: {exc}"}
 
 
-class Plugin:
-    """Dispatcharr's documented class-based plugin interface."""
-    name = "YTarr"
-    version = "0.1.3-test"
-    description = "YTarr proof-of-concept: create a Dispatcharr test channel from a YouTube video URL."
-    author = "Tw1zT3d2four7"
+def _configured_playlists(settings):
+    """Read up to five independently configurable playlist URLs.
 
-    fields = [
-        {"id": "youtube_url", "label": "YouTube video URL or video ID", "type": "string",
-         "default": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-         "help_text": "Test only. Use a public video you are authorized to access."},
-        {"id": "title", "label": "Track title", "type": "string", "default": "YTarr Playback Test"},
-        {"id": "artist", "label": "Artist", "type": "string", "default": "YTarr Test"},
-        {"id": "channel_group", "label": "Channel group", "type": "string", "default": DEFAULT_GROUP},
-        {"id": "channel_number", "label": "Channel number", "type": "number", "default": 9901},
-        {"id": "stream_profile", "label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
-         "help_text": "Must exactly match an existing Dispatcharr stream profile."},
+    Keep youtube_url as a backward-compatible fallback for older installs.
+    """
+    urls = []
+    for index in range(1, 6):
+        key = f"playlist_url_{index}"
+        fallback = DEFAULT_PLAYLIST if index == 1 else ""
+        value = _setting(settings, key, fallback)
+        if value:
+            urls.append((index, value))
+    if not urls:
+        legacy = _setting(settings, "youtube_url", DEFAULT_PLAYLIST)
+        if legacy:
+            urls.append((1, legacy))
+    # Deduplicate repeated playlist IDs while preserving order.
+    unique, seen = [], set()
+    for slot, url in urls:
+        playlist_id = _playlist_id(url)
+        identity = playlist_id or url.strip()
+        if identity not in seen:
+            unique.append((slot, url, playlist_id))
+            seen.add(identity)
+    return unique
+
+
+def import_playlist(settings=None):
+    """Import tracks from up to five public playlists in one action."""
+    settings = settings or {}
+    playlists = _configured_playlists(settings)
+    if not playlists:
+        return {"success": False, "message": "Add at least one valid YouTube or YouTube Music playlist URL."}
+    invalid = [{"slot": slot, "url": url} for slot, url, playlist_id in playlists if not playlist_id]
+    if invalid:
+        return {"success": False, "message": "One or more playlist fields do not contain a valid YouTube playlist URL with a list= ID.", "invalid_playlists": invalid}
+    group_name = _setting(settings, "channel_group", DEFAULT_GROUP)
+    profile_name = _setting(settings, "stream_profile", DEFAULT_PROFILE)
+    try:
+        start_number = int(_setting(settings, "channel_number", "9901"))
+        max_tracks = int(_setting(settings, "max_tracks", "200"))
+        if start_number < 0 or max_tracks < 1 or max_tracks > 500:
+            raise ValueError
+    except ValueError:
+        return {"success": False, "message": "Starting channel number must be non-negative and max tracks must be between 1 and 500."}
+    try:
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+        profile = _profile_by_name(StreamProfile, profile_name)
+        if profile is None:
+            return {"success": False, "message": f"Stream profile '{profile_name}' was not found.", "available_profiles": _profile_names(StreamProfile)}
+
+        imported, errors, playlist_results, seen_video_ids = [], [], [], set()
+        next_channel_number = start_number
+        for slot, url, playlist_id in playlists:
+            try:
+                playlist_title, tracks = _playlist_tracks(playlist_id, max_tracks=max_tracks)
+                if not tracks:
+                    playlist_results.append({"slot": slot, "playlist_id": playlist_id, "playlist_title": playlist_title,
+                                             "tracks_found": 0, "imported_or_updated": 0,
+                                             "error": "No track video IDs found; playlist may be private/unavailable or YouTube changed its response."})
+                    continue
+                playlist_imported = 0
+                for track in tracks:
+                    video_id = track.get("video_id")
+                    if not video_id or video_id in seen_video_ids:
+                        continue
+                    seen_video_ids.add(video_id)
+                    try:
+                        result = _create_track(settings, track, group_name, profile, next_channel_number)
+                        result.update({"source_playlist_id": playlist_id, "source_playlist_title": playlist_title})
+                        imported.append(result)
+                        playlist_imported += 1
+                        next_channel_number += 1
+                    except Exception as exc:
+                        errors.append({"playlist_id": playlist_id, "video_id": video_id, "error": f"{type(exc).__name__}: {exc}"})
+                playlist_results.append({"slot": slot, "playlist_id": playlist_id, "playlist_title": playlist_title,
+                                         "tracks_found": len(tracks), "imported_or_updated": playlist_imported})
+            except urllib.error.HTTPError as exc:
+                playlist_results.append({"slot": slot, "playlist_id": playlist_id, "error": f"YouTube Music rejected request (HTTP {exc.code}). Playlist may be private or endpoint changed."})
+            except urllib.error.URLError as exc:
+                playlist_results.append({"slot": slot, "playlist_id": playlist_id, "error": f"Could not reach YouTube Music: {exc.reason}"})
+            except Exception as exc:
+                playlist_results.append({"slot": slot, "playlist_id": playlist_id, "error": f"{type(exc).__name__}: {exc}"})
+
+        epg_result = None
+        epg_error = None
+        try:
+            epg_result = _sync_dummy_epg()
+        except Exception as exc:
+            epg_error = f"{type(exc).__name__}: {exc}"
+        ok_count = sum(1 for item in playlist_results if item.get("imported_or_updated", 0) > 0)
+        return {"success": bool(imported),
+                "message": f"Imported/updated {len(imported)} unique tracks from {ok_count} of {len(playlists)} configured playlist(s).",
+                "configured_playlists": len(playlists), "playlist_results": playlist_results,
+                "channel_group": group_name, "stream_profile": profile_name,
+                "tracks_imported_or_updated": len(imported), "errors": errors[:20],
+                "dummy_epg": epg_result, "dummy_epg_error": epg_error,
+                "duplicate_tracks_skipped": "Duplicate video IDs across playlists are imported only once.",
+                "continuous_radio_channel": False,
+                "note": "This test build creates selectable individual track channels. A single continuous channel that automatically advances tracks is not implemented yet."}
+    except Exception as exc:
+        return {"success": False, "message": f"Playlist import failed: {type(exc).__name__}: {exc}"}
+
+
+def get_settings():
+    fields = {
+        "channel_group": {"label": "Imported channel group", "type": "string", "default": DEFAULT_GROUP},
+        "channel_number": {"label": "Starting channel number", "type": "number", "default": 9901},
+        "stream_profile": {"label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
+                           "description": "Must match an existing Dispatcharr stream profile."},
+        "max_tracks": {"label": "Maximum tracks per playlist", "type": "number", "default": 200,
+                       "description": "Safety cap for each playlist; allowed range 1-500."}
+    }
+    for index in range(1, 6):
+        fields[f"playlist_url_{index}"] = {
+            "label": f"YouTube Music playlist {index} URL",
+            "type": "string",
+            "default": DEFAULT_PLAYLIST if index == 1 else "",
+            "description": "Paste a public YouTube or YouTube Music playlist URL. Leave blank to skip this slot."
+        }
+    return fields
+
+
+def get_actions():
+    return [
+        {"id": "check_status", "name": "Check YTarr Status", "description": "Check Dispatcharr model access and stream profile."},
+        {"id": "import_playlist", "name": "Import YouTube Music Playlists (up to 5)", "description": "Import all configured playlist URLs and create/update one selectable channel per unique track."},
+        {"id": "generate_dummy_epg", "name": "Generate/Refresh Dummy EPG", "description": "Attach existing YTarr channels to a dummy EPG and create seven days of placeholder programme listings."}
     ]
 
+
+def run(action, settings=None, **kwargs):
+    settings = settings or {}
+    action_id = action.get("id") or action.get("action") or action.get("name") if isinstance(action, dict) else action
+    action_id = str(action_id or kwargs.get("action_id", "")).strip().lower()
+    if action_id in ("check_status", "check ytarr status"):
+        return check_status(settings)
+    if action_id in ("import_playlist", "import youtube music playlist"):
+        return import_playlist(settings)
+    if action_id in ("generate_dummy_epg", "generate dummy epg", "refresh_dummy_epg"):
+        return generate_dummy_epg(settings)
+    return {"success": False, "message": f"Unknown YTarr action: {action_id}"}
+
+
+class Plugin:
+    name = "YTarr"
+    version = "0.2.4-test"
+    description = "Import YouTube Music playlists with artwork and generate a native dummy EPG for guide labels."
+    author = "Tw1zT3d2four7"
+    fields = [
+        {"id": "playlist_url_1", "label": "YouTube Music playlist 1 URL", "type": "string", "default": DEFAULT_PLAYLIST,
+         "help_text": "Public YouTube / YouTube Music playlist URL. Leave other slots blank to skip them."},
+        {"id": "playlist_url_2", "label": "YouTube Music playlist 2 URL", "type": "string", "default": ""},
+        {"id": "playlist_url_3", "label": "YouTube Music playlist 3 URL", "type": "string", "default": ""},
+        {"id": "playlist_url_4", "label": "YouTube Music playlist 4 URL", "type": "string", "default": ""},
+        {"id": "playlist_url_5", "label": "YouTube Music playlist 5 URL", "type": "string", "default": ""},
+        {"id": "channel_group", "label": "Imported channel group", "type": "string", "default": DEFAULT_GROUP},
+        {"id": "channel_number", "label": "Starting channel number", "type": "number", "default": 9901},
+        {"id": "stream_profile", "label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
+         "help_text": "Must exactly match an existing Dispatcharr stream profile."},
+        {"id": "max_tracks", "label": "Maximum tracks per playlist", "type": "number", "default": 200},
+    ]
     actions = [
-        {"id": "check_status", "label": "Check YTarr Test Status",
-         "description": "Check access to Dispatcharr models and the selected stream profile.",
+        {"id": "check_status", "label": "Check YTarr Status", "description": "Check model access and configured profile.",
          "button_label": "Check Status", "button_variant": "filled", "button_color": "blue"},
-        {"id": "create_test_channel", "label": "Create / Update Test Track Channel",
-         "description": "Create or update one test channel using a canonical YouTube URL.",
-         "button_label": "Create Test Channel", "button_variant": "filled", "button_color": "green",
-         "confirm": {"required": True, "title": "Create test channel?",
-                     "message": "This will create or update a test channel in Dispatcharr."}},
+        {"id": "import_playlist", "label": "Import YouTube Music Playlists (up to 5)", "description": "Import all configured playlist URLs and create/update one selectable channel for each unique track.",
+         "button_label": "Import Playlists", "button_variant": "filled", "button_color": "green",
+         "confirm": {"required": True, "title": "Import playlists?", "message": "This will create or update channels for tracks found in up to five configured public playlists."}},
+        {"id": "generate_dummy_epg", "label": "Generate/Refresh Dummy EPG", "description": "Generate placeholder programme listings for existing YTarr channels so names appear in the guide.",
+         "button_label": "Refresh Dummy EPG", "button_variant": "filled", "button_color": "blue"},
     ]
 
     def run(self, action: str, params: dict, context: dict):
-        settings = (context or {}).get("settings", {}) or {}
-        logger = (context or {}).get("logger")
+        context = context or {}
+        settings = context.get("settings", {}) or {}
+        logger = context.get("logger")
         if logger:
-            logger.info("YTarr test action requested: %s", action)
-        if action == "check_status":
-            result = check_status(settings)
-        elif action == "create_test_channel":
-            result = create_test_channel(settings)
-        else:
-            result = {"success": False, "message": f"Unknown YTarr action: {action}"}
-        # Dispatcharr's plugin UI expects a status/message result.
-        return {
-            "status": "ok" if result.get("success") else "error",
-            "message": result.get("message", "YTarr action finished."),
-            "details": result,
-        }
+            logger.info("YTarr action requested: %s", action)
+        result = run(action, settings)
+        return {"status": "ok" if result.get("success") else "error",
+                "message": result.get("message", "YTarr action finished."), "details": result}
