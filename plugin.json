@@ -1,6 +1,6 @@
 {
   "name": "YTarr",
-  "version": "0.2.5-test",
+  "version": "0.2.6-test",
   "author": "Tw1zT3d2four7",
   "description": "Import up to five YouTube Music playlists into Dispatcharr with artwork, native dummy EPG listings, and continuous radio channels.",
   "fields": [
@@ -71,6 +71,13 @@
       "type": "boolean",
       "default": true,
       "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."
+    },
+    {
+      "id": "playlist_scan_interval_minutes",
+      "label": "Playlist rescan interval (minutes)",
+      "type": "number",
+      "default": 30,
+      "help_text": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."
     }
   ],
   "actions": [
