@@ -48,8 +48,8 @@ jobs:
           import os, tempfile
           with tempfile.TemporaryDirectory() as temp_dir:
               fake_tools = {
-                  "streamlink": "#!/usr/bin/env python3\\nprint('https://example.test/fake-audio')\\n",
-                  "ffmpeg": "#!/usr/bin/env python3\\nimport sys\\nsys.stdout.buffer.write(b'YTARR_TEST_AUDIO_FRAME')\\nsys.stdout.buffer.flush()\\n",
+                  "streamlink": "#!/usr/bin/env python3\nprint('https://example.test/fake-audio')\n",
+                  "ffmpeg": "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'YTARR_TEST_AUDIO_FRAME')\nsys.stdout.buffer.flush()\n",
               }
               for name, script in fake_tools.items():
                   path = os.path.join(temp_dir, name)
