@@ -1,0 +1,69 @@
+{
+  "name": "YTarr",
+  "version": "0.1.3-test",
+  "author": "Tw1zT3d2four7",
+  "description": "YTarr proof-of-concept: create a Dispatcharr test channel from a YouTube video URL, with verified channel-group assignment.",
+  "fields": [
+    {
+      "id": "youtube_url",
+      "label": "YouTube video URL or video ID",
+      "type": "string",
+      "default": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "help_text": "Test only. Use a public video you are authorized to access."
+    },
+    {
+      "id": "title",
+      "label": "Track title",
+      "type": "string",
+      "default": "YTarr Playback Test"
+    },
+    {
+      "id": "artist",
+      "label": "Artist",
+      "type": "string",
+      "default": "YTarr Test"
+    },
+    {
+      "id": "channel_group",
+      "label": "Channel group",
+      "type": "string",
+      "default": "YTarr Music TEST"
+    },
+    {
+      "id": "channel_number",
+      "label": "Channel number",
+      "type": "number",
+      "default": 9901
+    },
+    {
+      "id": "stream_profile",
+      "label": "Stream profile name",
+      "type": "string",
+      "default": "Streamlink",
+      "help_text": "Must exactly match an existing Dispatcharr stream profile."
+    }
+  ],
+  "actions": [
+    {
+      "id": "check_status",
+      "label": "Check YTarr Test Status",
+      "description": "Check access to Dispatcharr models and the selected stream profile.",
+      "button_label": "Check Status",
+      "button_variant": "filled",
+      "button_color": "blue"
+    },
+    {
+      "id": "create_test_channel",
+      "label": "Create / Update Test Track Channel",
+      "description": "Create or update one test channel using a canonical YouTube URL.",
+      "button_label": "Create Test Channel",
+      "button_variant": "filled",
+      "button_color": "green",
+      "confirm": {
+        "required": true,
+        "title": "Create test channel?",
+        "message": "This will create or update a test channel in Dispatcharr."
+      }
+    }
+  ]
+}
