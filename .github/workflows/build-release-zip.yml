@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-    # Avoid rerunning when the workflow's own generated ZIP is the only change.
+    # Don't rerun when only the generated ZIP changes.
     paths-ignore:
       - release.zip
   workflow_dispatch:
@@ -20,6 +20,7 @@ jobs:
   build-release-zip:
     name: Package plugin and refresh release.zip
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out main
         uses: actions/checkout@v4
@@ -31,44 +32,96 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f plugin.json || { echo "::error::plugin.json is missing from the repository root"; exit 1; }
-          test -f plugin.py || { echo "::error::plugin.py is missing from the repository root"; exit 1; }
+
+          test -f plugin.json || {
+            echo "::error::plugin.json is missing from the repository root"
+            exit 1
+          }
+
+          test -f plugin.py || {
+            echo "::error::plugin.py is missing from the repository root"
+            exit 1
+          }
+
           python - <<'PY'
           import json
           from pathlib import Path
-          manifest = json.loads(Path("plugin.json").read_text(encoding="utf-8"))
+
+          manifest = json.loads(
+              Path("plugin.json").read_text(encoding="utf-8")
+          )
+
           version = manifest.get("version")
+
           if not version:
-              raise SystemExit("plugin.json must define a version")
+              raise SystemExit(
+                  "plugin.json must define a version"
+              )
+
           print(f"Packaging YTarr version {version}")
           PY
 
-      - name: Build installable release.zip
+      - name: Build and publish release.zip safely
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf package
-          mkdir -p package/ytarr
-          cp plugin.json plugin.py package/ytarr/
-          if [[ -f README.md ]]; then cp README.md package/ytarr/; fi
-          (
-            cd package
-            zip -qr ../release.zip ytarr
-          )
-          unzip -l release.zip
 
-      - name: Commit updated release.zip to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add release.zip
-          if git diff --cached --quiet; then
-            echo "release.zip is already up to date."
-            exit 0
-          fi
-          VERSION="$(python -c 'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])')"
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(release): rebuild release.zip for ${VERSION} [skip ci]"
-          git push origin HEAD:main
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Retry if main changes while the ZIP is being published.
+          for attempt in 1 2 3 4 5; do
+            echo "Release ZIP publish attempt ${attempt}/5"
+
+            # Always start from the latest main.
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Rebuild the installable plugin archive.
+            rm -rf package release.zip
+            mkdir -p package/ytarr
+
+            cp plugin.json plugin.py package/ytarr/
+
+            if [[ -f README.md ]]; then
+              cp README.md package/ytarr/
+            fi
+
+            (
+              cd package
+              zip -qr ../release.zip ytarr
+            )
+
+            echo "Generated archive contents:"
+            unzip -l release.zip
+
+            # Stage only the generated release archive.
+            git add release.zip
+
+            if git diff --cached --quiet; then
+              echo "release.zip is already up to date."
+              exit 0
+            fi
+
+            VERSION="$(
+              python -c \
+                'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])'
+            )"
+
+            git commit \
+              -m "chore(release): rebuild release.zip for ${VERSION} [skip ci]"
+
+            # Publish the archive. If main advanced, retry from its
+            # latest commit instead of leaving a stale ZIP behind.
+            if git push origin HEAD:main; then
+              echo "Published release.zip for YTarr ${VERSION}."
+              exit 0
+            fi
+
+            echo "Push failed. Retrying against the latest main."
+            sleep $((attempt * 2))
+          done
+
+          echo "::error::Could not publish release.zip after 5 attempts."
+          exit 1
