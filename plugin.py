@@ -1,4 +1,4 @@
-"""YTarr 0.2.7-test: YouTube / YouTube Music playlist importer for Dispatcharr.
+"""YTarr 0.2.8-test: YouTube / YouTube Music playlist importer for Dispatcharr.
 
 This plugin uses only Python's standard library and Dispatcharr's own models.
 It does not add a companion service/container or change Dispatcharr itself.
@@ -1169,7 +1169,7 @@ def run(action, settings=None, **kwargs):
 
 class Plugin:
     name = "YTarr"
-    version = "0.2.7-test"
+    version = "0.2.8-test"
     description = "Import YouTube Music playlists with artwork, dummy EPG, continuous radio, and automatic playlist rescans."
     author = "Tw1zT3d2four7"
     fields = [
