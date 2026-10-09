@@ -370,70 +370,165 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-        # Keep one HTTP response open and resolve each track only when needed.
-        # That avoids expired YouTube media URLs and gives players one continuous
-        # audio stream rather than requiring the user to select each channel.
-        while True:
-            failed_tracks = 0
-            for video_id in video_ids:
-                watch_url = "https://www.youtube.com/watch?v=" + video_id
-                process = None
-                try:
-                    resolved = subprocess.run(
-                        ["streamlink", "--loglevel", "error", "--stream-url", watch_url, "best"],
-                        capture_output=True, text=True, timeout=40, check=True,
-                    ).stdout.strip().splitlines()
-                    if not resolved or not resolved[-1].startswith(("http://", "https://")):
-                        raise RuntimeError("Streamlink did not return a media URL")
-                    media_url = resolved[-1]
-                    process = subprocess.Popen(
-                        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                         "-i", media_url, "-map", "0:a:0?", "-vn", "-ac", "2",
-                         "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k",
-                         "-f", "mp3", "-write_xing", "0", "-id3v2_version", "0", "pipe:1"],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
-                    )
-                    while True:
-                        chunk = process.stdout.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    exit_code = process.wait()
-                    if exit_code:
-                        failed_tracks += 1
-                        logger.warning("YTarr radio ffmpeg exited %s for video %s", exit_code, video_id)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    if process and process.poll() is None:
-                        process.terminate()
-                    return
-                except Exception as exc:
-                    failed_tracks += 1
-                    logger.warning("YTarr radio skipped video %s: %s", video_id, exc)
-                    if process and process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                if failed_tracks >= len(video_ids):
-                    # Avoid a hot loop if YouTube blocks requests or all tracks fail.
-                    time.sleep(5)
-                    break
-            # Re-fetch the playlist at the end of each complete pass. Newly added
-            # tracks are appended to this live stream without restarting playback.
+        # Encode all playlist tracks through one persistent MP3 encoder. Starting
+        # a fresh MP3 muxer per song can expose per-file duration/Xing metadata;
+        # some clients then stop at the first track even while HTTP stays open.
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        stop_event = threading.Event()
+        encoder = None
+        decoder_state = {"process": None}
+        decoder_lock = threading.Lock()
+
+        def feed_playlist_audio():
+            nonlocal video_ids
             try:
-                _, refreshed_tracks = _playlist_tracks(playlist_id, max_tracks=500)
-                refreshed_ids = [track["video_id"] for track in refreshed_tracks
-                                 if track.get("video_id")]
-                known_ids = set(video_ids)
-                added_ids = [video_id for video_id in refreshed_ids if video_id not in known_ids]
-                if added_ids:
-                    video_ids.extend(added_ids)
-                    logger.info("YTarr radio playlist %s discovered %d newly added track(s)",
-                                playlist_id, len(added_ids))
-            except Exception as exc:
-                logger.warning("YTarr radio could not refresh playlist %s: %s", playlist_id, exc)
+                while not stop_event.is_set():
+                    pass_had_audio = False
+                    for video_id in list(video_ids):
+                        if stop_event.is_set():
+                            break
+                        watch_url = "https://www.youtube.com/watch?v=" + video_id
+                        decoder = None
+                        try:
+                            resolved = subprocess.run(
+                                ["streamlink", "--loglevel", "error", "--stream-url",
+                                 watch_url, "best"],
+                                capture_output=True, text=True, timeout=40, check=True,
+                            ).stdout.strip().splitlines()
+                            if not resolved or not resolved[-1].startswith(("http://", "https://")):
+                                raise RuntimeError("Streamlink did not return a media URL")
+                            media_url = resolved[-1]
+                            # Decode each song to raw PCM. PCM has no per-track container
+                            # headers, timestamps, or duration markers to terminate playback.
+                            decoder = subprocess.Popen(
+                                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                                 "-i", media_url, "-map", "0:a:0?", "-vn", "-ac", "2",
+                                 "-ar", "44100", "-f", "s16le", "-acodec", "pcm_s16le",
+                                 "pipe:1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+                            )
+                            with decoder_lock:
+                                decoder_state["process"] = decoder
+                            track_had_audio = False
+                            while not stop_event.is_set():
+                                chunk = decoder.stdout.read(65536)
+                                if not chunk:
+                                    break
+                                encoder.stdin.write(chunk)
+                                encoder.stdin.flush()
+                                track_had_audio = True
+                                pass_had_audio = True
+                            exit_code = decoder.wait(timeout=5)
+                            if not track_had_audio or exit_code:
+                                logger.warning(
+                                    "YTarr radio decoder ended with code %s for video %s (audio=%s)",
+                                    exit_code, video_id, track_had_audio,
+                                )
+                        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                            if not stop_event.is_set():
+                                logger.warning("YTarr radio audio feeder stopped: %s", exc)
+                            stop_event.set()
+                            return
+                        except Exception as exc:
+                            logger.warning("YTarr radio skipped video %s: %s", video_id, exc)
+                        finally:
+                            if decoder and decoder.poll() is None:
+                                decoder.terminate()
+                                try:
+                                    decoder.wait(timeout=2)
+                                except subprocess.TimeoutExpired:
+                                    decoder.kill()
+                            with decoder_lock:
+                                if decoder_state["process"] is decoder:
+                                    decoder_state["process"] = None
+
+                    if stop_event.is_set():
+                        break
+
+                    # Re-fetch at the end of each pass and append new items without
+                    # restarting the encoder or cutting off the current HTTP response.
+                    try:
+                        _, refreshed_tracks = _playlist_tracks(playlist_id, max_tracks=500)
+                        refreshed_ids = [track["video_id"] for track in refreshed_tracks
+                                         if track.get("video_id")]
+                        known_ids = set(video_ids)
+                        added_ids = [video_id for video_id in refreshed_ids if video_id not in known_ids]
+                        if added_ids:
+                            video_ids.extend(added_ids)
+                            logger.info("YTarr radio playlist %s discovered %d newly added track(s)",
+                                        playlist_id, len(added_ids))
+                    except Exception as exc:
+                        logger.warning("YTarr radio could not refresh playlist %s: %s", playlist_id, exc)
+
+                    if not pass_had_audio:
+                        # Avoid a hot loop when YouTube is unavailable; retry this
+                        # playlist after a short pause rather than closing the radio stream.
+                        stop_event.wait(5)
+            except Exception:
+                logger.exception("YTarr radio audio feeder failed")
+                stop_event.set()
+            finally:
+                try:
+                    encoder.stdin.close()
+                except (AttributeError, BrokenPipeError, OSError):
+                    pass
+
+        try:
+            # This is the only MP3 muxer/encoder for the whole listener session.
+            # Each track's decoded PCM is fed into its stdin until the client leaves.
+            encoder = subprocess.Popen(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+                 "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+                 "-flush_packets", "1", "-f", "mp3", "-write_xing", "0",
+                 "-id3v2_version", "0", "pipe:1"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            feeder = threading.Thread(target=feed_playlist_audio,
+                                      name="ytarr-radio-audio-feeder", daemon=True)
+            feeder.start()
+            while not stop_event.is_set():
+                chunk = encoder.stdout.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception:
+            logger.exception("YTarr radio output stream failed")
+        finally:
+            stop_event.set()
+            with decoder_lock:
+                active_decoder = decoder_state["process"]
+            if active_decoder and active_decoder.poll() is None:
+                active_decoder.terminate()
+            if encoder and encoder.poll() is None:
+                encoder.terminate()
+                try:
+                    encoder.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    encoder.kill()
+            if encoder:
+                try:
+                    encoder.stdout.close()
+                except (AttributeError, OSError):
+                    pass
+                try:
+                    encoder.stdin.close()
+                except (AttributeError, OSError):
+                    pass
+
 
 
 def _ensure_radio_server():
