@@ -1,4 +1,4 @@
-"""YTarr 0.2.8-test: YouTube / YouTube Music playlist importer for Dispatcharr.
+"""YTarr 0.2.7-test: YouTube / YouTube Music playlist importer for Dispatcharr.
 
 This plugin uses only Python's standard library and Dispatcharr's own models.
 It does not add a companion service/container or change Dispatcharr itself.
@@ -22,7 +22,6 @@ RADIO_HOST = "127.0.0.1"
 RADIO_PORT = 8765
 _RADIO_SERVER = None
 _RADIO_SERVER_LOCK = threading.Lock()
-_RADIO_ENABLED = True
 _SCAN_LOCK = threading.Lock()
 _SCAN_STOP = threading.Event()
 _SCAN_WAKE = threading.Event()
@@ -349,11 +348,7 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
             self.send_error(503, "YTarr radio requires: " + ", ".join(missing))
             return
 
-        if not _radio_enabled_for_playlist(match.group(1)):
-            self.send_error(503, "YTarr continuous radio is disabled in plugin settings")
-            return
-
-        playlist_id = match.group(1)
+         playlist_id = match.group(1)
         try:
             playlist_title, tracks = _playlist_tracks(playlist_id, max_tracks=500)
         except Exception as exc:
@@ -378,6 +373,16 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
         # Encode all playlist tracks through one persistent MP3 encoder. Starting
         # a fresh MP3 muxer per song can expose per-file duration/Xing metadata;
         # some clients then stop at the first track even while HTTP stays open.
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
         stop_event = threading.Event()
         encoder = None
         decoder_state = {"process": None}
@@ -557,36 +562,6 @@ def _ensure_radio_server():
             return False, f"Could not start YTarr radio endpoint on port {RADIO_PORT}: {exc}"
 
 
-def _set_radio_enabled(enabled):
-    """Persist the radio toggle on existing radio streams so it survives restarts."""
-    global _RADIO_ENABLED
-    _RADIO_ENABLED = bool(enabled)
-    try:
-        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
-        for stream in Stream.objects.filter(tvg_id__startswith="ytarr:radio:"):
-            properties = dict(getattr(stream, "custom_properties", None) or {})
-            properties["continuous_radio_enabled"] = _RADIO_ENABLED
-            stream.custom_properties = properties
-            stream.save(update_fields=["custom_properties"])
-    except Exception:
-        logger.exception("Could not persist YTarr continuous radio enabled state")
-
-
-def _radio_enabled_for_playlist(playlist_id):
-    """Read persisted radio state, falling back to process state for older channels."""
-    try:
-        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
-        stream = Stream.objects.filter(tvg_id=f"ytarr:radio:{playlist_id}").first()
-        if stream is not None:
-            properties = getattr(stream, "custom_properties", None) or {}
-            if "continuous_radio_enabled" in properties:
-                value = properties["continuous_radio_enabled"]
-                return value if isinstance(value, bool) else str(value).strip().lower() not in ("false", "0", "no", "off", "")
-    except Exception:
-        logger.exception("Could not read persisted YTarr radio enabled state")
-    return _RADIO_ENABLED
-
-
 def _radio_stream_url(profile_command, playlist_id):
     """Format the endpoint URL for the configured Dispatcharr source command."""
     endpoint_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
@@ -614,7 +589,6 @@ def _create_radio_channel(playlist_id, playlist_title, group_name, profile, chan
             "provider": "ytarr", "continuous_radio": True,
             "playlist_id": playlist_id, "playlist_title": safe_title,
             "playback_endpoint": endpoint_url,
-            "continuous_radio_enabled": True,
         },
     }
     stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
@@ -1082,7 +1056,8 @@ def import_playlist(settings=None):
         imported, errors, playlist_results, seen_video_ids = [], [], [], set()
         radio_channels, radio_errors = [], []
         continuous_radio = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
-        _set_radio_enabled(continuous_radio)
+        global _RADIO_ENABLED
+        _RADIO_ENABLED = continuous_radio
         radio_ready, radio_status = _ensure_radio_server() if continuous_radio else (False, "Continuous radio disabled.")
         next_channel_number = start_number
         for slot, url, playlist_id in playlists:
@@ -1161,8 +1136,8 @@ def get_settings():
                            "description": "Must match an existing Dispatcharr stream profile."},
         "max_tracks": {"label": "Maximum tracks per playlist", "type": "number", "default": 200,
                        "description": "Safety cap for each playlist; allowed range 1-500."},
-        "continuous_radio": {"label": "Enable continuous radio playback", "type": "boolean", "default": True,
-                             "description": "When enabled, create radio channels and allow continuous playback. When disabled, existing radio endpoints are also blocked. Requires streamlink and ffmpeg in the Dispatcharr container."},
+        "continuous_radio": {"label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
+                             "description": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."},
         "playlist_scan_interval_minutes": {"label": "Playlist rescan interval (minutes)", "type": "number",
                                            "default": 30, "description": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."}
     }
@@ -1199,7 +1174,7 @@ def run(action, settings=None, **kwargs):
 
 class Plugin:
     name = "YTarr"
-    version = "0.2.8-test"
+    version = "0.2.7-test"
     description = "Import YouTube Music playlists with artwork, dummy EPG, continuous radio, and automatic playlist rescans."
     author = "Tw1zT3d2four7"
     fields = [
@@ -1214,8 +1189,8 @@ class Plugin:
         {"id": "stream_profile", "label": "Stream profile name", "type": "string", "default": DEFAULT_PROFILE,
          "help_text": "Must exactly match an existing Dispatcharr stream profile."},
         {"id": "max_tracks", "label": "Maximum tracks per playlist", "type": "number", "default": 200},
-        {"id": "continuous_radio", "label": "Enable continuous radio playback", "type": "boolean", "default": True,
-         "help_text": "When enabled, create radio channels and allow their continuous playback endpoints. When disabled, radio playback endpoints return HTTP 503. Requires streamlink and ffmpeg in Dispatcharr."},
+        {"id": "continuous_radio", "label": "Create continuous radio channel(s)", "type": "boolean", "default": True,
+         "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in Dispatcharr."},
         {"id": "playlist_scan_interval_minutes", "label": "Playlist rescan interval (minutes)", "type": "number", "default": 30,
          "help_text": "Automatically compare configured YouTube playlists and import newly added songs. Allowed range 5–1440 minutes."},
     ]
@@ -1234,8 +1209,8 @@ class Plugin:
         settings = context.get("settings", {}) or {}
         # The setting controls actual radio playback as well as channel creation.
         # Keep this process-wide gate in sync on every plugin action, not just imports.
-        enabled = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
-        _set_radio_enabled(enabled)
+        global _RADIO_ENABLED
+        _RADIO_ENABLED = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
         logger = context.get("logger")
         if logger:
             logger.info("YTarr action requested: %s", action)
