@@ -1,6 +1,6 @@
 {
   "name": "YTarr",
-  "version": "0.2.7-test",
+  "version": "0.2.8-test",
   "author": "Tw1zT3d2four7",
   "description": "Import up to five YouTube Music playlists into Dispatcharr with artwork, native dummy EPG listings, and continuous radio channels.",
   "fields": [
@@ -67,10 +67,10 @@
     },
     {
       "id": "continuous_radio",
-      "label": "Create continuous radio channel(s)",
+      "label": "Enable continuous radio playback",
       "type": "boolean",
       "default": true,
-      "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."
+      "help_text": "When enabled, create radio channels and allow their continuous playback endpoints. When disabled, radio playback endpoints return HTTP 503. Requires streamlink and ffmpeg in the Dispatcharr container."
     },
     {
       "id": "playlist_scan_interval_minutes",
