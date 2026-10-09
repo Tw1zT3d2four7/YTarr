@@ -38,6 +38,8 @@ jobs:
           configured = module._configured_playlists({"playlist_url_1": playlist})
           assert len(configured) == 1 and configured[0][2] == "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
           assert module.RADIO_PORT == 8765
+          assert module._radio_stream_url("streamlink", "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y") == "httpstream://http://127.0.0.1:8765/ytarr/radio/PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
+          assert module._radio_stream_url("ffmpeg", "PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y") == "http://127.0.0.1:8765/ytarr/radio/PL5LF_xiPbHiDadP4pjl3h28-1y6oBvY7y"
           module._radio_dependencies = lambda: []
           started, message = module._ensure_radio_server()
           assert started, message
