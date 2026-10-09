@@ -1,127 +1,66 @@
-name: Build YTarr release ZIP
+name: Build YTarr release asset
 
 on:
   push:
-    branches:
-      - main
-    # Don't rerun when only the generated ZIP changes.
-    paths-ignore:
-      - release.zip
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: ytarr-release-main
+  group: ytarr-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-release-zip:
-    name: Package plugin and refresh release.zip
+  build-release:
+    name: Build and attach YTarr ZIP to GitHub Release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out main
+      - name: Check out tagged source
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
-      - name: Validate plugin files
+      - name: Validate plugin files and version
+        id: version
         shell: bash
         run: |
           set -euo pipefail
+          test -f plugin.json || { echo "::error::plugin.json is missing"; exit 1; }
+          test -f plugin.py || { echo "::error::plugin.py is missing"; exit 1; }
 
-          test -f plugin.json || {
-            echo "::error::plugin.json is missing from the repository root"
+          VERSION="$(python -c 'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Packaging YTarr $VERSION"
+
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match plugin.json version $VERSION"
             exit 1
-          }
+          fi
 
-          test -f plugin.py || {
-            echo "::error::plugin.py is missing from the repository root"
-            exit 1
-          }
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          manifest = json.loads(
-              Path("plugin.json").read_text(encoding="utf-8")
-          )
-
-          version = manifest.get("version")
-
-          if not version:
-              raise SystemExit(
-                  "plugin.json must define a version"
-              )
-
-          print(f"Packaging YTarr version {version}")
-          PY
-
-      - name: Build and publish release.zip safely
+      - name: Build installable ZIP
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf package ytarr.zip
+          mkdir -p package/ytarr
+          cp plugin.json plugin.py package/ytarr/
+          if [[ -f README.md ]]; then
+            cp README.md package/ytarr/
+          fi
+          (cd package && zip -qr ../ytarr.zip ytarr)
+          echo "Generated release asset contents:"
+          unzip -l ytarr.zip
 
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Retry if main changes while the ZIP is being published.
-          for attempt in 1 2 3 4 5; do
-            echo "Release ZIP publish attempt ${attempt}/5"
-
-            # Always start from the latest main.
-            git fetch origin main
-            git reset --hard origin/main
-
-            # Rebuild the installable plugin archive.
-            rm -rf package release.zip
-            mkdir -p package/ytarr
-
-            cp plugin.json plugin.py package/ytarr/
-
-            if [[ -f README.md ]]; then
-              cp README.md package/ytarr/
-            fi
-
-            (
-              cd package
-              zip -qr ../release.zip ytarr
-            )
-
-            echo "Generated archive contents:"
-            unzip -l release.zip
-
-            # Stage only the generated release archive.
-            git add release.zip
-
-            if git diff --cached --quiet; then
-              echo "release.zip is already up to date."
-              exit 0
-            fi
-
-            VERSION="$(
-              python -c \
-                'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])'
-            )"
-
-            git commit \
-              -m "chore(release): rebuild release.zip for ${VERSION} [skip ci]"
-
-            # Publish the archive. If main advanced, retry from its
-            # latest commit instead of leaving a stale ZIP behind.
-            if git push origin HEAD:main; then
-              echo "Published release.zip for YTarr ${VERSION}."
-              exit 0
-            fi
-
-            echo "Push failed. Retrying against the latest main."
-            sleep $((attempt * 2))
-          done
-
-          echo "::error::Could not publish release.zip after 5 attempts."
-          exit 1
+      - name: Publish ZIP to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ytarr.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: false
