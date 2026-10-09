@@ -349,7 +349,7 @@ class _RadioRequestHandler(BaseHTTPRequestHandler):
             self.send_error(503, "YTarr radio requires: " + ", ".join(missing))
             return
 
-        if not _RADIO_ENABLED:
+        if not _radio_enabled_for_playlist(match.group(1)):
             self.send_error(503, "YTarr continuous radio is disabled in plugin settings")
             return
 
@@ -557,6 +557,36 @@ def _ensure_radio_server():
             return False, f"Could not start YTarr radio endpoint on port {RADIO_PORT}: {exc}"
 
 
+def _set_radio_enabled(enabled):
+    """Persist the radio toggle on existing radio streams so it survives restarts."""
+    global _RADIO_ENABLED
+    _RADIO_ENABLED = bool(enabled)
+    try:
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+        for stream in Stream.objects.filter(tvg_id__startswith="ytarr:radio:"):
+            properties = dict(getattr(stream, "custom_properties", None) or {})
+            properties["continuous_radio_enabled"] = _RADIO_ENABLED
+            stream.custom_properties = properties
+            stream.save(update_fields=["custom_properties"])
+    except Exception:
+        logger.exception("Could not persist YTarr continuous radio enabled state")
+
+
+def _radio_enabled_for_playlist(playlist_id):
+    """Read persisted radio state, falling back to process state for older channels."""
+    try:
+        Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
+        stream = Stream.objects.filter(tvg_id=f"ytarr:radio:{playlist_id}").first()
+        if stream is not None:
+            properties = getattr(stream, "custom_properties", None) or {}
+            if "continuous_radio_enabled" in properties:
+                value = properties["continuous_radio_enabled"]
+                return value if isinstance(value, bool) else str(value).strip().lower() not in ("false", "0", "no", "off", "")
+    except Exception:
+        logger.exception("Could not read persisted YTarr radio enabled state")
+    return _RADIO_ENABLED
+
+
 def _radio_stream_url(profile_command, playlist_id):
     """Format the endpoint URL for the configured Dispatcharr source command."""
     endpoint_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
@@ -584,6 +614,7 @@ def _create_radio_channel(playlist_id, playlist_title, group_name, profile, chan
             "provider": "ytarr", "continuous_radio": True,
             "playlist_id": playlist_id, "playlist_title": safe_title,
             "playback_endpoint": endpoint_url,
+            "continuous_radio_enabled": True,
         },
     }
     stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
@@ -1051,8 +1082,7 @@ def import_playlist(settings=None):
         imported, errors, playlist_results, seen_video_ids = [], [], [], set()
         radio_channels, radio_errors = [], []
         continuous_radio = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
-        global _RADIO_ENABLED
-        _RADIO_ENABLED = continuous_radio
+        _set_radio_enabled(continuous_radio)
         radio_ready, radio_status = _ensure_radio_server() if continuous_radio else (False, "Continuous radio disabled.")
         next_channel_number = start_number
         for slot, url, playlist_id in playlists:
@@ -1204,8 +1234,8 @@ class Plugin:
         settings = context.get("settings", {}) or {}
         # The setting controls actual radio playback as well as channel creation.
         # Keep this process-wide gate in sync on every plugin action, not just imports.
-        global _RADIO_ENABLED
-        _RADIO_ENABLED = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
+        enabled = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
+        _set_radio_enabled(enabled)
         logger = context.get("logger")
         if logger:
             logger.info("YTarr action requested: %s", action)
