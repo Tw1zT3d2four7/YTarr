@@ -1056,8 +1056,6 @@ def import_playlist(settings=None):
         imported, errors, playlist_results, seen_video_ids = [], [], [], set()
         radio_channels, radio_errors = [], []
         continuous_radio = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
-        global _RADIO_ENABLED
-        _RADIO_ENABLED = continuous_radio
         radio_ready, radio_status = _ensure_radio_server() if continuous_radio else (False, "Continuous radio disabled.")
         next_channel_number = start_number
         for slot, url, playlist_id in playlists:
@@ -1209,8 +1207,6 @@ class Plugin:
         settings = context.get("settings", {}) or {}
         # The setting controls actual radio playback as well as channel creation.
         # Keep this process-wide gate in sync on every plugin action, not just imports.
-        global _RADIO_ENABLED
-        _RADIO_ENABLED = str(settings.get("continuous_radio", True)).strip().lower() not in ("false", "0", "no", "off", "")
         logger = context.get("logger")
         if logger:
             logger.info("YTarr action requested: %s", action)
