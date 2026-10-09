@@ -1,4 +1,4 @@
-# YTarr 0.2.8-test
+# YTarr 0.2.7-test
 
 Dispatcharr plugin for importing up to five public YouTube / YouTube Music playlists. It creates or updates one selectable channel per unique track in the configured group (default: `Country Music`). Track title, artist, and album-art thumbnail are read from playlist metadata automatically.
 
@@ -31,7 +31,7 @@ Dispatcharr plugin for importing up to five public YouTube / YouTube Music playl
 
 ## Continuous radio playback (test build)
 
-- **Enable continuous radio playback** is enabled by default. Each successfully fetched playlist gets a separate channel named `<playlist title> Radio`, alongside the individual track channels. When disabled, the plugin rejects requests to radio playback endpoints with HTTP 503; the setting gates playback, not only channel creation.
+- **Create continuous radio channel(s)** is enabled by default. Each successfully fetched playlist gets a separate channel named `<playlist title> Radio`, alongside the individual track channels.
 - The radio endpoint resolves each YouTube track when it is about to play, converts its audio to a continuous MP3 stream, and advances to the next playlist item automatically. This avoids relying on the Dispatcharr web player to advance between individual channels.
 - The endpoint runs inside the Dispatcharr plugin process on `127.0.0.1:8765`; it does not require a separate container or a published host port. The channel uses that local endpoint as its stream URL.
 - The Dispatcharr container must have both `streamlink` and `ffmpeg` available on PATH. **Check YTarr Status** reports missing executables. If either is missing, playlist imports still work but radio channels are not created.
