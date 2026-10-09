@@ -1,4 +1,4 @@
-# YTarr 0.2.5-test
+# YTarr 0.2.6-test
 
 Dispatcharr plugin for importing up to five public YouTube / YouTube Music playlists. It creates or updates one selectable channel per unique track in the configured group (default: `Country Music`). Track title, artist, and album-art thumbnail are read from playlist metadata automatically.
 
@@ -6,7 +6,7 @@ Dispatcharr plugin for importing up to five public YouTube / YouTube Music playl
 1. Import this ZIP through Dispatcharr → Plugins → Import and enable YTarr.
 2. Paste up to five public YouTube or YouTube Music playlist URLs into Playlist URL 1–5. Playlist 1 defaults to the Country Music playlist supplied for testing; unused slots may remain blank.
 3. Select an existing Dispatcharr stream profile (default `Streamlink`), a channel group, a starting channel number, and a per-playlist track cap.
-4. Run **Import YouTube Music Playlists (up to 5)**. The result reports per-playlist outcomes and the total tracks imported/updated.
+4. Set **Playlist rescan interval (minutes)** (default 30; allowed 5–1440), then run **Import YouTube Music Playlists (up to 5)** once. The result reports per-playlist outcomes, the total tracks imported/updated, and scanner status.
 
 ## Artwork behavior
 - Uses the playlist row's highest-resolution album-art thumbnail where available.
@@ -18,6 +18,9 @@ Dispatcharr plugin for importing up to five public YouTube / YouTube Music playl
 - No manual track title, artist, or image fields are needed.
 - Duplicate tracks across configured playlists are imported only once by YouTube video ID. Existing channels are updated using stable `ytarr:<video_id>` identifiers.
 - Public playlists only. YouTube may change its internal web endpoint or block requests; test the import from inside Dispatcharr.
+- **Automatic playlist comparison:** after the first import, YTarr checks the configured playlists on the selected interval (30 minutes by default), compares YouTube video IDs against existing YTarr channels, and creates channels for newly added songs without duplicating existing tracks. Newly created tracks are also linked into the dummy EPG.
+- The scanner attempts to resume after a Dispatcharr/plugin restart by recovering playlist IDs, group, and profile from existing YTarr radio channels. The radio stream independently refreshes its playlist after each complete pass, so songs added while listening can be queued for a later pass.
+- Check Status reports whether the scanner thread is running. A YouTube/network failure is logged and retried at the next interval; existing channels are not deleted.
 - This test build creates individual selectable track channels and, by default, one continuous radio channel per configured playlist. The radio channel streams audio continuously and automatically advances through playlist tracks.
 - No Dispatcharr source changes, extra service, or extra container.
 
