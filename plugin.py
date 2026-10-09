@@ -447,6 +447,17 @@ def _ensure_radio_server():
             return False, f"Could not start YTarr radio endpoint on port {RADIO_PORT}: {exc}"
 
 
+def _radio_stream_url(profile_command, playlist_id):
+    """Format the endpoint URL for the configured Dispatcharr source command."""
+    endpoint_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
+    command_name = os.path.basename((profile_command or "").strip()).lower()
+    # Streamlink needs its explicit protocol prefix for arbitrary HTTP audio
+    # endpoints whose path isn't a recognized media-file extension.
+    if "streamlink" in command_name:
+        return "httpstream://" + endpoint_url
+    return endpoint_url
+
+
 def _create_radio_channel(playlist_id, playlist_title, group_name, profile, channel_number):
     """Create one stable, continuous radio channel for a configured playlist."""
     Channel, ChannelGroup, Logo, Stream, StreamProfile = _models()
@@ -454,14 +465,15 @@ def _create_radio_channel(playlist_id, playlist_title, group_name, profile, chan
     safe_title = (playlist_title or "YouTube Playlist").strip() or "YouTube Playlist"
     channel_name = (safe_title + " Radio")[:512]
     tvg_id = f"ytarr:radio:{playlist_id}"
-    radio_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
+    endpoint_url = f"http://{RADIO_HOST}:{RADIO_PORT}/ytarr/radio/{playlist_id}"
+    radio_url = _radio_stream_url(getattr(profile, "command", ""), playlist_id)
     stream_defaults = {
         "name": channel_name, "url": radio_url, "channel_group": group,
         "stream_profile": profile, "is_custom": True, "is_radio": True,
         "custom_properties": {
             "provider": "ytarr", "continuous_radio": True,
             "playlist_id": playlist_id, "playlist_title": safe_title,
-            "playback_endpoint": radio_url,
+            "playback_endpoint": endpoint_url,
         },
     }
     stream, stream_created = Stream.objects.get_or_create(tvg_id=tvg_id, defaults=stream_defaults)
@@ -486,7 +498,7 @@ def _create_radio_channel(playlist_id, playlist_title, group_name, profile, chan
         "channel": channel.name, "channel_number": channel_number,
         "channel_id": channel.pk, "stream_id": stream.pk,
         "playlist_id": playlist_id, "playback_url": radio_url,
-        "created": channel_created or stream_created,
+        "playback_endpoint": endpoint_url, "created": channel_created or stream_created,
     }
 
 
