@@ -1,8 +1,8 @@
 {
   "name": "YTarr",
-  "version": "0.2.4-test",
+  "version": "0.2.5-test",
   "author": "Tw1zT3d2four7",
-  "description": "Import up to five YouTube Music playlists into Dispatcharr with artwork and a native dummy EPG for guide listings.",
+  "description": "Import up to five YouTube Music playlists into Dispatcharr with artwork, native dummy EPG listings, and continuous radio channels.",
   "fields": [
     {
       "id": "playlist_url_1",
@@ -64,6 +64,13 @@
       "type": "number",
       "default": 200,
       "help_text": "Safety cap per playlist; allowed range 1-500."
+    },
+    {
+      "id": "continuous_radio",
+      "label": "Create continuous radio channel(s)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Create one radio channel per playlist that automatically advances through tracks. Requires streamlink and ffmpeg in the Dispatcharr container."
     }
   ],
   "actions": [
